@@ -1,2 +1,12 @@
-/target
-taskflow
+# Rust build output
+/target/
+
+# Local C++ Taskflow reference checkout
+/taskflow/
+
+# Editor and OS noise
+.DS_Store
+.idea/
+.vscode/
+*.swp
+*.swo
