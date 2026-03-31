@@ -1,0 +1,11 @@
+[package]
+name = "flow-algorithms"
+version = "0.1.0"
+edition = "2024"
+
+[lib]
+name = "flow_algorithms"
+path = "src/lib.rs"
+
+[dependencies]
+flow-core = { path = "../flow-core" }

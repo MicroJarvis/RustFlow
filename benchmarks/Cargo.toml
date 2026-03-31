@@ -1,0 +1,16 @@
+[package]
+name = "benchmarks"
+version = "0.1.0"
+edition = "2024"
+
+[lib]
+name = "benchmarks"
+path = "src/lib.rs"
+
+[[bin]]
+name = "benchmarks"
+path = "src/main.rs"
+
+[dependencies]
+flow-algorithms = { path = "../flow-algorithms" }
+rayon = "1.11.0"

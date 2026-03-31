@@ -1,0 +1,7 @@
+[workspace]
+members = [
+  "benchmarks",
+  "flow-core",
+  "flow-algorithms",
+]
+resolver = "2"
