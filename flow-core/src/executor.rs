@@ -1,17 +1,46 @@
 use std::any::Any;
+use std::cell::RefCell;
 use std::collections::VecDeque;
 use std::panic::{self, AssertUnwindSafe};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex, RwLock};
 use std::thread::{self, JoinHandle};
 
-use crate::async_handle::{AsyncHandle, AsyncState};
+use crate::async_handle::{AsyncHandle, AsyncState, RuntimeAsyncState};
 use crate::error::FlowError;
 use crate::flow::{Flow, GraphSnapshot, NodeSnapshot, Subflow, TaskId, TaskKind};
 use crate::observer::Observer;
 use crate::runtime::RuntimeCtx;
 
 const WORKER_STACK_SIZE: usize = 16 * 1024 * 1024;
+
+#[derive(Clone)]
+struct RuntimeSpawnContext {
+    executor: Arc<ExecutorInner>,
+    worker_id: usize,
+    cancelled: Arc<AtomicBool>,
+}
+
+thread_local! {
+    static CURRENT_RUNTIME_SPAWN_CONTEXT: RefCell<Option<RuntimeSpawnContext>> = RefCell::new(None);
+}
+
+struct RuntimeSpawnContextGuard {
+    previous: Option<RuntimeSpawnContext>,
+}
+
+impl Drop for RuntimeSpawnContextGuard {
+    fn drop(&mut self) {
+        CURRENT_RUNTIME_SPAWN_CONTEXT.with(|slot| {
+            slot.replace(self.previous.take());
+        });
+    }
+}
+
+fn install_runtime_spawn_context(context: RuntimeSpawnContext) -> RuntimeSpawnContextGuard {
+    let previous = CURRENT_RUNTIME_SPAWN_CONTEXT.with(|slot| slot.replace(Some(context)));
+    RuntimeSpawnContextGuard { previous }
+}
 
 #[derive(Clone)]
 pub struct RunHandle {
@@ -76,7 +105,8 @@ impl RunHandleState {
 
     fn wait(&self) -> Result<(), FlowError> {
         if self.finished.load(Ordering::Acquire) {
-            return self.result
+            return self
+                .result
                 .lock()
                 .expect("run handle state poisoned")
                 .clone()
@@ -268,6 +298,26 @@ impl Executor {
         F: FnOnce(&RuntimeCtx) -> T + Send + 'static,
         T: Send + 'static,
     {
+        if let Some(context) = self.current_runtime_spawn_context() {
+            let state = Arc::new(RuntimeAsyncState::new());
+            let value_state = Arc::clone(&state);
+            let error_state = Arc::clone(&state);
+            self.inner.increment_active_runs();
+            self.inner.enqueue_async(
+                ScheduledAsyncTask::runtime_value(
+                    Box::new(move |runtime| {
+                        value_state.complete_success(task(runtime));
+                        Ok(())
+                    }),
+                    context.cancelled,
+                    Box::new(move |error| error_state.complete_error(error)),
+                ),
+                Some(context.worker_id),
+            );
+
+            return AsyncHandle::from_runtime_state(state);
+        }
+
         let state = Arc::new(AsyncState::new());
         let run_handle = self.schedule_async_runner(
             Box::new({
@@ -287,12 +337,14 @@ impl Executor {
     where
         F: FnOnce(&RuntimeCtx) + Send + 'static,
     {
-        self.schedule_async_runner(
+        let context = self.current_runtime_spawn_context();
+        self.schedule_async_runner_with_runtime_cancelled(
             Box::new(move |runtime| {
                 task(runtime);
                 Ok(())
             }),
-            None,
+            context.as_ref().map(|context| context.worker_id),
+            context.map(|context| context.cancelled),
         )
     }
 
@@ -314,15 +366,32 @@ impl Executor {
         handles: &[RunHandle],
         worker_id: usize,
     ) -> Result<(), FlowError> {
+        self.wait_until_inline(worker_id, || handles.iter().all(RunHandle::is_finished));
+
+        for handle in handles {
+            handle.wait()?;
+        }
+
+        Ok(())
+    }
+
+    pub(crate) fn wait_until_inline<F>(&self, worker_id: usize, mut done: F)
+    where
+        F: FnMut() -> bool,
+    {
         let mut known_epoch = self.inner.notifier.current_epoch();
+        let mut continuation = None;
 
         loop {
-            if handles.iter().all(RunHandle::is_finished) {
-                break;
+            if done() {
+                return;
             }
 
-            if let Some(task) = self.inner.next_task(worker_id) {
-                self.inner.execute(self, worker_id, task);
+            let task = continuation
+                .take()
+                .or_else(|| self.inner.next_task(worker_id));
+            if let Some(task) = task {
+                continuation = self.inner.execute(self, worker_id, task);
                 continue;
             }
 
@@ -330,12 +399,6 @@ impl Executor {
                 .notifier
                 .wait(&mut known_epoch, &self.inner.shutdown);
         }
-
-        for handle in handles {
-            handle.wait()?;
-        }
-
-        Ok(())
     }
 
     fn start_run(&self, snapshot: Arc<GraphSnapshot>, worker_hint: Option<usize>) -> RunHandle {
@@ -378,10 +441,27 @@ impl Executor {
         runner: Box<dyn FnOnce(&RuntimeCtx) -> Result<(), FlowError> + Send + 'static>,
         worker_hint: Option<usize>,
     ) -> RunHandle {
+        self.schedule_async_runner_with_runtime_cancelled(runner, worker_hint, None)
+    }
+
+    fn current_runtime_spawn_context(&self) -> Option<RuntimeSpawnContext> {
+        CURRENT_RUNTIME_SPAWN_CONTEXT.with(|slot| {
+            let context = slot.borrow().clone()?;
+            Arc::ptr_eq(&context.executor, &self.inner).then_some(context)
+        })
+    }
+
+    fn schedule_async_runner_with_runtime_cancelled(
+        &self,
+        runner: Box<dyn FnOnce(&RuntimeCtx) -> Result<(), FlowError> + Send + 'static>,
+        worker_hint: Option<usize>,
+        runtime_cancelled: Option<Arc<AtomicBool>>,
+    ) -> RunHandle {
         let handle = RunHandle::pending();
         self.inner.increment_active_runs();
+        let runtime_cancelled = runtime_cancelled.unwrap_or_else(|| handle.cancelled_flag());
         self.inner.enqueue_async(
-            ScheduledAsyncTask::new(runner, handle.clone()),
+            ScheduledAsyncTask::run_handle(runner, handle.clone(), runtime_cancelled),
             worker_hint,
         );
         handle
@@ -526,6 +606,20 @@ impl ExecutorInner {
         self.enqueue_graph(task, worker_hint);
     }
 
+    fn schedule_ready_graph(
+        &self,
+        continuation: &mut Option<ScheduledWork>,
+        task: ScheduledTask,
+        worker_hint: Option<usize>,
+    ) {
+        task.run.outstanding.fetch_add(1, Ordering::AcqRel);
+        if continuation.is_none() {
+            *continuation = Some(ScheduledWork::Graph(task));
+        } else {
+            self.enqueue_graph(task, worker_hint);
+        }
+    }
+
     fn enqueue_graph(&self, task: ScheduledTask, worker_hint: Option<usize>) {
         self.enqueue(ScheduledWork::Graph(task), worker_hint);
     }
@@ -575,23 +669,37 @@ impl ExecutorInner {
         None
     }
 
-    fn execute(&self, executor: &Executor, worker_id: usize, scheduled: ScheduledWork) {
+    fn execute(
+        &self,
+        executor: &Executor,
+        worker_id: usize,
+        scheduled: ScheduledWork,
+    ) -> Option<ScheduledWork> {
         match scheduled {
             ScheduledWork::Graph(task) => self.execute_graph(executor, worker_id, task),
-            ScheduledWork::Async(task) => self.execute_async(executor, worker_id, task),
+            ScheduledWork::Async(task) => {
+                self.execute_async(executor, worker_id, task);
+                None
+            }
         }
     }
 
-    fn execute_graph(&self, executor: &Executor, worker_id: usize, scheduled: ScheduledTask) {
+    fn execute_graph(
+        &self,
+        executor: &Executor,
+        worker_id: usize,
+        scheduled: ScheduledTask,
+    ) -> Option<ScheduledWork> {
         let node = &scheduled.run.graph.nodes[scheduled.task_index];
+        let mut continuation = None;
 
         if scheduled.run.is_cancelled() {
             self.finish_task(&scheduled);
-            return;
+            return None;
         }
 
         if !self.acquire_all(node, &scheduled, Some(worker_id)) {
-            return;
+            return None;
         }
 
         let run = Arc::clone(&scheduled.run);
@@ -624,14 +732,15 @@ impl ExecutorInner {
 
         if scheduled.run.is_cancelled() {
             self.finish_task(&scheduled);
-            return;
+            return None;
         }
 
         if node.kind.is_condition() {
             if let Ok(Some(successors)) = selected_successors {
                 for successor_position in successors {
                     if let Some(&successor) = node.successors.get(successor_position) {
-                        self.schedule(
+                        self.schedule_ready_graph(
+                            &mut continuation,
                             ScheduledTask {
                                 run: Arc::clone(&scheduled.run),
                                 task_index: successor,
@@ -646,7 +755,8 @@ impl ExecutorInner {
                 let previous = scheduled.run.pending[successor].fetch_sub(1, Ordering::AcqRel);
                 debug_assert!(previous > 0, "successor pending count underflow");
                 if previous == 1 {
-                    self.schedule(
+                    self.schedule_ready_graph(
+                        &mut continuation,
                         ScheduledTask {
                             run: Arc::clone(&scheduled.run),
                             task_index: successor,
@@ -658,15 +768,23 @@ impl ExecutorInner {
         }
 
         self.finish_task(&scheduled);
+        continuation
     }
 
-    fn execute_async(&self, executor: &Executor, worker_id: usize, mut scheduled: ScheduledAsyncTask) {
+    fn execute_async(
+        &self,
+        executor: &Executor,
+        worker_id: usize,
+        mut scheduled: ScheduledAsyncTask,
+    ) {
         if scheduled
-            .run_handle
-            .cancelled_flag()
-            .load(Ordering::Acquire)
+            .skip_if_cancelled
+            .as_ref()
+            .is_some_and(|cancelled| cancelled.load(Ordering::Acquire))
         {
-            scheduled.run_handle.complete(Ok(()));
+            if let Some(on_success) = scheduled.on_success.take() {
+                on_success();
+            }
             self.decrement_active_runs();
             self.notifier.notify_all();
             return;
@@ -676,14 +794,34 @@ impl ExecutorInner {
             .runner
             .take()
             .expect("async runner scheduled more than once");
-        let cancelled = scheduled.run_handle.cancelled_flag();
-        let runtime = RuntimeCtx::new(executor.clone(), worker_id, None, cancelled);
+        let runtime = RuntimeCtx::new(
+            executor.clone(),
+            worker_id,
+            None,
+            Arc::clone(&scheduled.runtime_cancelled),
+        );
+        let _runtime_context = install_runtime_spawn_context(RuntimeSpawnContext {
+            executor: Arc::clone(&executor.inner),
+            worker_id,
+            cancelled: Arc::clone(&scheduled.runtime_cancelled),
+        });
         let result = match panic::catch_unwind(AssertUnwindSafe(|| runner(&runtime))) {
             Ok(result) => result,
             Err(payload) => Err(FlowError::plain(panic_payload_to_string(payload))),
         };
 
-        scheduled.run_handle.complete(result);
+        match result {
+            Ok(()) => {
+                if let Some(on_success) = scheduled.on_success.take() {
+                    on_success();
+                }
+            }
+            Err(error) => {
+                if let Some(on_error) = scheduled.on_error.take() {
+                    on_error(error);
+                }
+            }
+        }
         self.decrement_active_runs();
         self.notifier.notify_all();
     }
@@ -747,18 +885,42 @@ enum ScheduledWork {
 }
 
 struct ScheduledAsyncTask {
-    run_handle: RunHandle,
     runner: Option<Box<dyn FnOnce(&RuntimeCtx) -> Result<(), FlowError> + Send + 'static>>,
+    runtime_cancelled: Arc<AtomicBool>,
+    skip_if_cancelled: Option<Arc<AtomicBool>>,
+    on_success: Option<Box<dyn FnOnce() + Send + 'static>>,
+    on_error: Option<Box<dyn FnOnce(FlowError) + Send + 'static>>,
 }
 
 impl ScheduledAsyncTask {
-    fn new(
+    fn run_handle(
         runner: Box<dyn FnOnce(&RuntimeCtx) -> Result<(), FlowError> + Send + 'static>,
         run_handle: RunHandle,
+        runtime_cancelled: Arc<AtomicBool>,
     ) -> Self {
         Self {
-            run_handle,
             runner: Some(runner),
+            runtime_cancelled,
+            skip_if_cancelled: Some(run_handle.cancelled_flag()),
+            on_success: Some(Box::new({
+                let run_handle = run_handle.clone();
+                move || run_handle.complete(Ok(()))
+            })),
+            on_error: Some(Box::new(move |error| run_handle.complete(Err(error)))),
+        }
+    }
+
+    fn runtime_value(
+        runner: Box<dyn FnOnce(&RuntimeCtx) -> Result<(), FlowError> + Send + 'static>,
+        runtime_cancelled: Arc<AtomicBool>,
+        on_error: Box<dyn FnOnce(FlowError) + Send + 'static>,
+    ) -> Self {
+        Self {
+            runner: Some(runner),
+            runtime_cancelled,
+            skip_if_cancelled: None,
+            on_success: None,
+            on_error: Some(on_error),
         }
     }
 }
@@ -824,10 +986,12 @@ fn worker_loop(worker_id: usize, inner: Arc<ExecutorInner>) {
         inner: Arc::clone(&inner),
     };
     let mut known_epoch = inner.notifier.current_epoch();
+    let mut continuation = None;
 
     while !inner.shutdown.load(Ordering::Acquire) {
-        if let Some(task) = inner.next_task(worker_id) {
-            inner.execute(&executor, worker_id, task);
+        let task = continuation.take().or_else(|| inner.next_task(worker_id));
+        if let Some(task) = task {
+            continuation = inner.execute(&executor, worker_id, task);
             continue;
         }
 
@@ -867,7 +1031,17 @@ fn execute_node_inline(
             )),
         },
         TaskKind::Runtime(task) => {
-            let runtime = RuntimeCtx::new(executor.clone(), worker_id, scheduler, cancelled);
+            let runtime = RuntimeCtx::new(
+                executor.clone(),
+                worker_id,
+                scheduler,
+                Arc::clone(&cancelled),
+            );
+            let _runtime_context = install_runtime_spawn_context(RuntimeSpawnContext {
+                executor: Arc::clone(&executor.inner),
+                worker_id,
+                cancelled,
+            });
             match panic::catch_unwind(AssertUnwindSafe(|| task(&runtime))) {
                 Ok(()) => Ok(None),
                 Err(payload) => Err(FlowError::panic(

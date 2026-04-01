@@ -213,7 +213,9 @@ fn runtime_fibonacci(runtime: &RuntimeCtx, n: usize) -> usize {
         .executor()
         .runtime_async(move |runtime| runtime_fibonacci(runtime, n - 2));
 
-    runtime.wait_async(left).expect("left runtime async should succeed")
+    runtime
+        .wait_async(left)
+        .expect("left runtime async should succeed")
         + runtime
             .wait_async(right)
             .expect("right runtime async should succeed")
@@ -269,6 +271,46 @@ fn runtime_wait_async_surfaces_child_panics() {
         .expect("parent runtime flow should succeed when panic is handled");
 
     assert!(saw_error.load(Ordering::SeqCst));
+}
+
+#[test]
+fn runtime_async_child_can_observe_parent_cancellation() {
+    let executor = Executor::new(1);
+    let flow = Flow::new();
+    let child_reached = Arc::new(AtomicBool::new(false));
+    let child_cancelled = Arc::new(AtomicBool::new(false));
+
+    {
+        let child_reached = Arc::clone(&child_reached);
+        let child_cancelled = Arc::clone(&child_cancelled);
+        flow.spawn_runtime(move |runtime| {
+            let child_reached = Arc::clone(&child_reached);
+            let child_cancelled = Arc::clone(&child_cancelled);
+            let handle = runtime.executor().runtime_async(move |runtime| {
+                child_reached.store(true, Ordering::SeqCst);
+                while !runtime.is_cancelled() {
+                    std::thread::yield_now();
+                }
+                child_cancelled.store(true, Ordering::SeqCst);
+            });
+
+            runtime
+                .wait_async(handle)
+                .expect("runtime async child should stop after parent cancellation");
+        });
+    }
+
+    let handle = executor.run(&flow);
+    while !child_reached.load(Ordering::SeqCst) {
+        std::thread::yield_now();
+    }
+
+    assert!(handle.cancel(), "parent runtime flow should be cancellable");
+    handle
+        .wait()
+        .expect("cancelled parent runtime flow should drain cleanly");
+
+    assert!(child_cancelled.load(Ordering::SeqCst));
 }
 
 #[test]

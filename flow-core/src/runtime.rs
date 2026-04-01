@@ -1,7 +1,7 @@
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 
-use crate::async_handle::AsyncHandle;
+use crate::async_handle::{AsyncHandle, RuntimeAsyncState};
 use crate::error::FlowError;
 use crate::executor::{Executor, RunHandle};
 use crate::flow::{Flow, TaskHandle, TaskId};
@@ -68,5 +68,14 @@ impl RuntimeCtx {
 
     pub fn is_cancelled(&self) -> bool {
         self.cancelled.load(Ordering::Acquire)
+    }
+
+    pub(crate) fn wait_runtime_async_state<T>(
+        &self,
+        state: &RuntimeAsyncState<T>,
+    ) -> Result<(), FlowError> {
+        self.executor
+            .wait_until_inline(self.worker_id, || state.is_finished());
+        Ok(())
     }
 }
