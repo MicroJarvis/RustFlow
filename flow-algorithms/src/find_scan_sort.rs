@@ -3,7 +3,7 @@ use std::sync::Arc;
 
 use flow_core::{AsyncHandle, Executor, FlowError};
 
-use crate::parallel_for::{ParallelForOptions, chunk_ranges};
+use crate::parallel_for::{ParallelForOptions, chunk_ranges_for_workers};
 
 pub fn parallel_find<T, F>(
     executor: &Executor,
@@ -20,7 +20,7 @@ where
     }
 
     let predicate = Arc::new(predicate);
-    let handles = chunk_ranges(0..input.len(), options)
+    let handles = chunk_ranges_for_workers(0..input.len(), options, executor.num_workers())
         .into_iter()
         .map(|chunk| {
             let input = Arc::clone(&input);
@@ -48,7 +48,7 @@ where
         return Ok(Vec::new());
     }
 
-    let chunks = chunk_ranges(0..input.len(), options);
+    let chunks = chunk_ranges_for_workers(0..input.len(), options, executor.num_workers());
     let op = Arc::new(op);
     let chunk_prefixes = build_chunk_prefixes(executor, Arc::clone(&input), &chunks, &op, None)?;
 
@@ -97,7 +97,7 @@ where
         return Ok(Vec::new());
     }
 
-    let chunks = chunk_ranges(0..input.len(), options);
+    let chunks = chunk_ranges_for_workers(0..input.len(), options, executor.num_workers());
     let op = Arc::new(op);
     let chunk_prefixes =
         build_chunk_prefixes(executor, Arc::clone(&input), &chunks, &op, Some(init))?;
@@ -151,7 +151,7 @@ where
     }
 
     let compare = Arc::new(compare);
-    let chunk_size = options.resolve_chunk_size(input.len());
+    let chunk_size = options.resolve_chunk_size_for_workers(input.len(), executor.num_workers());
     let handles = split_chunks(input, chunk_size)
         .into_iter()
         .map(|mut chunk| {

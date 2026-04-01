@@ -33,14 +33,11 @@ impl ParallelForOptions {
         }
     }
 
-    pub(crate) fn resolve_chunk_size(self, len: usize) -> usize {
+    pub(crate) fn resolve_chunk_size_for_workers(self, len: usize, workers: usize) -> usize {
         match self.chunk_size {
             ChunkSize::Fixed(chunk_size) => chunk_size,
             ChunkSize::Auto => {
-                let workers = std::thread::available_parallelism()
-                    .map(usize::from)
-                    .unwrap_or(1);
-                let target_chunks = workers.saturating_mul(4).max(1);
+                let target_chunks = workers.max(1).saturating_mul(4).max(1);
                 len.div_ceil(target_chunks).max(1)
             }
         }
@@ -48,12 +45,23 @@ impl ParallelForOptions {
 }
 
 pub(crate) fn chunk_ranges(range: Range<usize>, options: ParallelForOptions) -> Vec<Range<usize>> {
+    let workers = std::thread::available_parallelism()
+        .map(usize::from)
+        .unwrap_or(1);
+    chunk_ranges_for_workers(range, options, workers)
+}
+
+pub(crate) fn chunk_ranges_for_workers(
+    range: Range<usize>,
+    options: ParallelForOptions,
+    workers: usize,
+) -> Vec<Range<usize>> {
     let len = range.end.saturating_sub(range.start);
     if len == 0 {
         return Vec::new();
     }
 
-    let chunk_size = options.resolve_chunk_size(len);
+    let chunk_size = options.resolve_chunk_size_for_workers(len, workers);
     let mut chunks = Vec::new();
     let mut chunk_start = range.start;
 

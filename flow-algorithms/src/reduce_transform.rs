@@ -3,7 +3,7 @@ use std::sync::{Arc, Mutex};
 
 use flow_core::{Executor, Flow, FlowError};
 
-use crate::parallel_for::{ParallelForOptions, chunk_ranges};
+use crate::parallel_for::{ParallelForOptions, chunk_ranges_for_workers};
 
 struct CompletionGuard {
     remaining: Arc<AtomicUsize>,
@@ -38,7 +38,7 @@ where
 
     let flow = Flow::new();
     let transform = Arc::new(transform);
-    let chunks = chunk_ranges(0..input.len(), options);
+    let chunks = chunk_ranges_for_workers(0..input.len(), options, executor.num_workers());
     let remaining = Arc::new(AtomicUsize::new(chunks.len()));
     let output = Arc::new(
         (0..input.len())
@@ -101,7 +101,7 @@ where
 
     let flow = Flow::new();
     let reduce = Arc::new(reduce);
-    let chunks = chunk_ranges(0..input.len(), options);
+    let chunks = chunk_ranges_for_workers(0..input.len(), options, executor.num_workers());
     let remaining = Arc::new(AtomicUsize::new(chunks.len()));
     let partials = Arc::new(
         (0..chunks.len())

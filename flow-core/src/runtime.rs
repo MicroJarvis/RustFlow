@@ -1,8 +1,9 @@
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
+use crate::async_handle::AsyncHandle;
 use crate::error::FlowError;
-use crate::executor::Executor;
+use crate::executor::{Executor, RunHandle};
 use crate::flow::{Flow, TaskHandle, TaskId};
 
 type RuntimeScheduler = Arc<dyn Fn(TaskId) + Send + Sync + 'static>;
@@ -51,6 +52,18 @@ impl RuntimeCtx {
 
     pub fn corun(&self, flow: &Flow) -> Result<(), FlowError> {
         self.executor.corun_inline(flow, self.worker_id)
+    }
+
+    pub fn corun_handle(&self, handle: &RunHandle) -> Result<(), FlowError> {
+        self.executor.wait_handle_inline(handle, self.worker_id)
+    }
+
+    pub fn corun_handles(&self, handles: &[RunHandle]) -> Result<(), FlowError> {
+        self.executor.wait_handles_inline(handles, self.worker_id)
+    }
+
+    pub fn wait_async<T>(&self, handle: AsyncHandle<T>) -> Result<T, FlowError> {
+        handle.wait_with_runtime(self)
     }
 
     pub fn is_cancelled(&self) -> bool {

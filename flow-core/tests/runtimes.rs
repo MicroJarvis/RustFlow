@@ -2,7 +2,7 @@ use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
-use flow_core::{Executor, Flow};
+use flow_core::{Executor, Flow, RuntimeCtx};
 
 #[test]
 fn runtime_task_can_access_executor_and_worker_context() {
@@ -199,4 +199,134 @@ fn runtime_corun_supports_child_runtime_scheduling() {
 
     assert_eq!(scheduled_hits.load(Ordering::SeqCst), 1);
     assert_eq!(done_hits.load(Ordering::SeqCst), 1);
+}
+
+fn runtime_fibonacci(runtime: &RuntimeCtx, n: usize) -> usize {
+    if n < 2 {
+        return n;
+    }
+
+    let left = runtime
+        .executor()
+        .runtime_async(move |runtime| runtime_fibonacci(runtime, n - 1));
+    let right = runtime
+        .executor()
+        .runtime_async(move |runtime| runtime_fibonacci(runtime, n - 2));
+
+    runtime.wait_async(left).expect("left runtime async should succeed")
+        + runtime
+            .wait_async(right)
+            .expect("right runtime async should succeed")
+}
+
+#[test]
+fn runtime_async_can_wait_inline_on_a_single_worker() {
+    let executor = Executor::new(1);
+    let flow = Flow::new();
+    let result = Arc::new(Mutex::new(None));
+
+    {
+        let result = Arc::clone(&result);
+        flow.spawn_runtime(move |runtime| {
+            *result.lock().expect("result slot poisoned") = Some(runtime_fibonacci(runtime, 10));
+        });
+    }
+
+    executor
+        .run(&flow)
+        .wait()
+        .expect("runtime async recursion should succeed");
+
+    assert_eq!(
+        result.lock().expect("result slot poisoned").take(),
+        Some(55)
+    );
+}
+
+#[test]
+fn runtime_wait_async_surfaces_child_panics() {
+    let executor = Executor::new(1);
+    let flow = Flow::new();
+    let saw_error = Arc::new(AtomicBool::new(false));
+
+    {
+        let saw_error = Arc::clone(&saw_error);
+        flow.spawn_runtime(move |runtime| {
+            let handle = runtime.executor().runtime_async(|_| -> usize {
+                panic!("runtime async child boom");
+            });
+            let error = runtime
+                .wait_async(handle)
+                .expect_err("runtime async child panic should surface");
+            assert!(error.message().contains("runtime async child boom"));
+            saw_error.store(true, Ordering::SeqCst);
+        });
+    }
+
+    executor
+        .run(&flow)
+        .wait()
+        .expect("parent runtime flow should succeed when panic is handled");
+
+    assert!(saw_error.load(Ordering::SeqCst));
+}
+
+#[test]
+fn runtime_corun_handles_waits_for_all_children() {
+    let executor = Executor::new(1);
+    let flow = Flow::new();
+    let hits = Arc::new(AtomicUsize::new(0));
+
+    {
+        let hits = Arc::clone(&hits);
+        flow.spawn_runtime(move |runtime| {
+            let handles = (0..4)
+                .map(|_| {
+                    let hits = Arc::clone(&hits);
+                    runtime.executor().runtime_silent_async(move |_| {
+                        hits.fetch_add(1, Ordering::SeqCst);
+                    })
+                })
+                .collect::<Vec<_>>();
+
+            runtime
+                .corun_handles(&handles)
+                .expect("runtime corun_handles should succeed");
+        });
+    }
+
+    executor
+        .run(&flow)
+        .wait()
+        .expect("parent runtime flow should succeed");
+
+    assert_eq!(hits.load(Ordering::SeqCst), 4);
+}
+
+#[test]
+fn runtime_corun_handles_surfaces_child_panics() {
+    let executor = Executor::new(1);
+    let flow = Flow::new();
+    let saw_error = Arc::new(AtomicBool::new(false));
+
+    {
+        let saw_error = Arc::clone(&saw_error);
+        flow.spawn_runtime(move |runtime| {
+            let handles = vec![runtime.executor().runtime_silent_async(|_| {
+                panic!("runtime silent async child boom");
+            })];
+            let error = runtime
+                .corun_handles(&handles)
+                .expect_err("runtime corun_handles child panic should surface");
+            assert!(error.message().contains("runtime silent async child boom"));
+            saw_error.store(true, Ordering::SeqCst);
+        });
+    }
+
+    executor
+        .run(&flow)
+        .wait()
+        .expect("parent runtime flow should succeed when panic is handled");
+
+    assert!(saw_error.load(Ordering::SeqCst));
 }

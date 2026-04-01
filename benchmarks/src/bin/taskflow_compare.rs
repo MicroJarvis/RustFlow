@@ -12,8 +12,10 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use flow_algorithms::{
-    DataPipeline, Executor, Flow, ParallelForOptions, Pipe, PipeType, Pipeline, TaskHandle,
-    parallel_inclusive_scan, parallel_reduce, parallel_sort, parallel_transform,
+    DataPipeline, Executor, Flow, ParallelForOptions, Pipe, PipeType, Pipeline, RuntimeCtx,
+    TaskHandle,
+    ParallelForExt, parallel_inclusive_scan, parallel_reduce, parallel_sort,
+    parallel_transform,
 };
 
 unsafe extern "C" {
@@ -620,6 +622,17 @@ where
     Ok(total / rounds as f64)
 }
 
+fn average_reported_ms<F>(rounds: usize, mut operation: F) -> Result<f64, String>
+where
+    F: FnMut() -> Result<f64, String>,
+{
+    let mut total = 0.0;
+    for _ in 0..rounds {
+        total += operation()?;
+    }
+    Ok(total / rounds as f64)
+}
+
 fn checksum_u8(values: &[u8]) -> u64 {
     values.iter().fold(1_469_598_103_934_665_603u64, |acc, value| {
         acc.wrapping_mul(1_099_511_628_211).wrapping_add(*value as u64)
@@ -637,6 +650,43 @@ fn checksum_f64(values: &[f64]) -> u64 {
     values.iter().fold(1_469_598_103_934_665_603u64, |acc, value| {
         acc.wrapping_mul(1_099_511_628_211).wrapping_add(value.to_bits())
     })
+}
+
+fn checksum_f32(values: &[f32]) -> u64 {
+    values.iter().fold(1_469_598_103_934_665_603u64, |acc, value| {
+        acc.wrapping_mul(1_099_511_628_211)
+            .wrapping_add(value.to_bits() as u64)
+    })
+}
+
+fn auto_chunk_size_for_workers(len: usize, workers: usize) -> usize {
+    let target_chunks = workers.max(1).saturating_mul(4).max(1);
+    len.div_ceil(target_chunks).max(1)
+}
+
+#[derive(Clone, Copy)]
+struct SharedMutPtr<T>(*mut T);
+
+unsafe impl<T: Send> Send for SharedMutPtr<T> {}
+unsafe impl<T: Send> Sync for SharedMutPtr<T> {}
+
+impl<T> SharedMutPtr<T> {
+    fn from_slice(values: &mut [T]) -> Self {
+        Self(values.as_mut_ptr())
+    }
+
+    unsafe fn update<F, R>(self, index: usize, mut update: F) -> R
+    where
+        F: FnMut(&mut T) -> R,
+    {
+        unsafe { update(&mut *self.0.add(index)) }
+    }
+
+    unsafe fn write(self, index: usize, value: T) {
+        unsafe {
+            self.0.add(index).write(value);
+        }
+    }
 }
 
 fn pow2_points(start_exp: usize, end_exp: usize) -> Vec<PointSpec> {
@@ -825,6 +875,56 @@ fn black_scholes_price(option: BlackScholesOption) -> f32 {
     } else {
         future_value_x * (1.0 - nof_xd2) - option.s * (1.0 - nof_xd1)
     }
+}
+
+fn run_for_each_flow(executor: &Executor, values: &mut [f64]) -> Result<(), String> {
+    if values.is_empty() {
+        return Ok(());
+    }
+
+    let flow = Flow::new();
+    let values_ptr = SharedMutPtr::from_slice(values);
+    let options = ParallelForOptions::default()
+        .with_chunk_size(auto_chunk_size_for_workers(values.len(), executor.num_workers()));
+
+    let _tasks = flow.parallel_for(0..values.len(), options, move |index| unsafe {
+        values_ptr.update(index, |value| {
+            *value = value.tan();
+        });
+    });
+
+    executor.run(&flow).wait().map_err(|error| error.to_string())
+}
+
+fn build_black_scholes_flow(
+    input: Arc<[BlackScholesOption]>,
+    prices: &mut [f32],
+    worker_count: usize,
+) -> Flow {
+    let flow = Flow::new();
+
+    if input.is_empty() {
+        return flow;
+    }
+
+    assert_eq!(
+        prices.len(),
+        input.len(),
+        "black-scholes output buffer length must match the input length"
+    );
+
+    let prices_ptr = SharedMutPtr::from_slice(prices);
+    let options = ParallelForOptions::default()
+        .with_chunk_size(auto_chunk_size_for_workers(input.len(), worker_count));
+
+    let _tasks = flow.parallel_for(0..input.len(), options, {
+        let input = Arc::clone(&input);
+        move |index| unsafe {
+            prices_ptr.write(index, black_scholes_price(input[index]));
+        }
+    });
+
+    flow
 }
 
 fn generate_black_scholes_options(num_options: usize) -> Arc<[BlackScholesOption]> {
@@ -1050,19 +1150,22 @@ fn run_black_scholes_case(config: &Config, harness: &TaskflowHarness) -> CaseRes
         taskflow_note,
         |num_options| {
             let options = generate_black_scholes_options(num_options);
-            average_ms(config.rounds, || {
-                let mut checksum = 0f64;
-                for _ in 0..num_options.max(1) {
-                    let prices = parallel_transform(
-                        &executor,
-                        Arc::clone(&options),
-                        ParallelForOptions::default(),
-                        |option| black_scholes_price(*option),
-                    )
-                    .map_err(|error| error.to_string())?;
-                    checksum += prices.iter().map(|value| *value as f64).sum::<f64>();
+            let mut prices = vec![0.0f32; options.len()];
+            let flow =
+                build_black_scholes_flow(Arc::clone(&options), &mut prices, executor.num_workers());
+
+            average_reported_ms(config.rounds, || {
+                let start = Instant::now();
+                for _ in 0..options.len().max(1) {
+                    executor
+                        .run(&flow)
+                        .wait()
+                        .map_err(|error| error.to_string())?;
                 }
-                Ok(checksum)
+                let elapsed_ms = start.elapsed().as_secs_f64() * 1_000.0;
+
+                black_box(checksum_f32(&prices));
+                Ok(elapsed_ms)
             })
         },
     )
@@ -1218,19 +1321,19 @@ fn run_for_each_case(config: &Config, harness: &TaskflowHarness) -> CaseResult {
         taskflow_points,
         taskflow_note,
         |size| {
-            average_ms(config.rounds, || {
-                let mut input = vec![0.0f64; size];
+            let mut input = vec![0.0f64; size];
+
+            average_reported_ms(config.rounds, || {
                 for value in &mut input {
                     *value = c_rand_value() as f64;
                 }
-                let output = parallel_transform(
-                    &executor,
-                    Arc::<[f64]>::from(input),
-                    ParallelForOptions::default(),
-                    |value| value.tan(),
-                )
-                .map_err(|error| error.to_string())?;
-                Ok(checksum_f64(&output))
+
+                let start = Instant::now();
+                run_for_each_flow(&executor, &mut input)?;
+                let elapsed_ms = start.elapsed().as_secs_f64() * 1_000.0;
+
+                black_box(checksum_f64(&input));
+                Ok(elapsed_ms)
             })
         },
     )
@@ -1940,43 +2043,80 @@ fn take_slot<T>(slot: &ValueSlot<T>) -> T {
         .expect("flow value slot should be initialized")
 }
 
-fn build_fibonacci(flow: &Flow, n: usize) -> FlowValue<usize> {
-    let slot = Arc::new(Mutex::new(None));
+fn fibonacci_runtime(runtime: &RuntimeCtx, n: usize) -> usize {
     if n < 2 {
-        let slot_for_task = Arc::clone(&slot);
-        let task = flow.spawn(move || {
-            *slot_for_task.lock().expect("fibonacci slot poisoned") = Some(n);
-        });
-        return FlowValue { task, slot };
+        return n;
     }
 
-    let left = build_fibonacci(flow, n - 1);
-    let right = build_fibonacci(flow, n - 2);
-    let left_slot = Arc::clone(&left.slot);
-    let right_slot = Arc::clone(&right.slot);
-    let slot_for_task = Arc::clone(&slot);
-    let task = flow.spawn(move || {
-        let value = take_slot(&left_slot) + take_slot(&right_slot);
-        *slot_for_task.lock().expect("fibonacci slot poisoned") = Some(value);
-    });
-    task.succeed([left.task.clone(), right.task.clone()]);
-    FlowValue { task, slot }
+    let left = runtime
+        .executor()
+        .runtime_async(move |runtime| fibonacci_runtime(runtime, n - 1));
+    let right = fibonacci_runtime(runtime, n - 2);
+
+    runtime
+        .wait_async(left)
+        .expect("left fibonacci runtime async should succeed")
+        + right
 }
 
 fn fibonacci_flow(executor: &Executor, n: usize) -> Result<usize, String> {
     let flow = Flow::new();
-    let result = build_fibonacci(&flow, n);
+    let result = Arc::new(Mutex::new(None));
+    {
+        let result = Arc::clone(&result);
+        flow.spawn_runtime(move |runtime| {
+            *result.lock().expect("fibonacci slot poisoned") = Some(fibonacci_runtime(runtime, n));
+        });
+    }
     executor.run(&flow).wait().map_err(|error| error.to_string())?;
-    Ok(take_slot(&result.slot))
+    Ok(result
+        .lock()
+        .expect("fibonacci slot poisoned")
+        .take()
+        .expect("fibonacci result should be initialized"))
 }
 
 fn fn_integrate(x: f64) -> f64 {
     (x * x + 1.0) * x
 }
 
-fn build_integrate(flow: &Flow, x1: f64, y1: f64, x2: f64, y2: f64, area: f64) -> FlowValue<f64> {
+fn integrate_sequential_iterative(x1: f64, y1: f64, x2: f64, y2: f64, area: f64) -> f64 {
     const EPSILON: f64 = 1.0e-9;
-    let slot = Arc::new(Mutex::new(None));
+    let mut stack = vec![(x1, y1, x2, y2, area)];
+    let mut total = 0.0;
+
+    while let Some((x1, y1, x2, y2, area)) = stack.pop() {
+        let half = (x2 - x1) / 2.0;
+        let x0 = x1 + half;
+        let y0 = fn_integrate(x0);
+
+        let area_x1x0 = (y1 + y0) / 2.0 * half;
+        let area_x0x2 = (y0 + y2) / 2.0 * half;
+        let area_x1x2 = area_x1x0 + area_x0x2;
+
+        if (area_x1x2 - area).abs() < EPSILON {
+            total += area_x1x2;
+            continue;
+        }
+
+        stack.push((x1, y1, x0, y0, area_x1x0));
+        stack.push((x0, y0, x2, y2, area_x0x2));
+    }
+
+    total
+}
+
+fn integrate_runtime(
+    runtime: &RuntimeCtx,
+    x1: f64,
+    y1: f64,
+    x2: f64,
+    y2: f64,
+    area: f64,
+    depth: usize,
+) -> f64 {
+    const EPSILON: f64 = 1.0e-9;
+    const RUNTIME_DEPTH_LIMIT: usize = 8;
     let half = (x2 - x1) / 2.0;
     let x0 = x1 + half;
     let y0 = fn_integrate(x0);
@@ -1986,31 +2126,42 @@ fn build_integrate(flow: &Flow, x1: f64, y1: f64, x2: f64, y2: f64, area: f64) -
     let area_x1x2 = area_x1x0 + area_x0x2;
 
     if (area_x1x2 - area).abs() < EPSILON {
-        let slot_for_task = Arc::clone(&slot);
-        let task = flow.spawn(move || {
-            *slot_for_task.lock().expect("integrate slot poisoned") = Some(area_x1x2);
-        });
-        return FlowValue { task, slot };
+        return area_x1x2;
     }
 
-    let left = build_integrate(flow, x1, y1, x0, y0, area_x1x0);
-    let right = build_integrate(flow, x0, y0, x2, y2, area_x0x2);
-    let left_slot = Arc::clone(&left.slot);
-    let right_slot = Arc::clone(&right.slot);
-    let slot_for_task = Arc::clone(&slot);
-    let task = flow.spawn(move || {
-        let value = take_slot(&left_slot) + take_slot(&right_slot);
-        *slot_for_task.lock().expect("integrate slot poisoned") = Some(value);
+    // Keep the outer recursive async shape aligned with Taskflow, but switch to an
+    // explicit worklist before Rust call stacks become the bottleneck.
+    if depth >= RUNTIME_DEPTH_LIMIT {
+        return integrate_sequential_iterative(x1, y1, x2, y2, area);
+    }
+
+    let left = runtime.executor().runtime_async(move |runtime| {
+        integrate_runtime(runtime, x1, y1, x0, y0, area_x1x0, depth + 1)
     });
-    task.succeed([left.task.clone(), right.task.clone()]);
-    FlowValue { task, slot }
+    let right = integrate_runtime(runtime, x0, y0, x2, y2, area_x0x2, depth + 1);
+
+    runtime
+        .wait_async(left)
+        .expect("left integrate runtime async should succeed")
+        + right
 }
 
 fn integrate_flow(executor: &Executor, x1: f64, y1: f64, x2: f64, y2: f64) -> Result<f64, String> {
     let flow = Flow::new();
-    let result = build_integrate(&flow, x1, y1, x2, y2, 0.0);
+    let result = Arc::new(Mutex::new(None));
+    {
+        let result = Arc::clone(&result);
+        flow.spawn_runtime(move |runtime| {
+            *result.lock().expect("integrate slot poisoned") =
+                Some(integrate_runtime(runtime, x1, y1, x2, y2, 0.0, 0));
+        });
+    }
     executor.run(&flow).wait().map_err(|error| error.to_string())?;
-    Ok(take_slot(&result.slot))
+    Ok(result
+        .lock()
+        .expect("integrate slot poisoned")
+        .take()
+        .expect("integrate result should be initialized"))
 }
 
 fn merge_sorted(left: Vec<f64>, right: Vec<f64>) -> Vec<f64> {
@@ -2085,50 +2236,61 @@ fn queens_ok(a: &[i8], n: usize) -> bool {
     true
 }
 
-fn build_nqueens(flow: &Flow, column: usize, mut buffer: Vec<i8>) -> FlowValue<i32> {
+fn nqueens_sequential(column: usize, buffer: &mut [i8]) -> i32 {
     let size = buffer.len();
-    let slot = Arc::new(Mutex::new(None));
     if size == column {
-        let slot_for_task = Arc::clone(&slot);
-        let task = flow.spawn(move || {
-            *slot_for_task.lock().expect("nqueens slot poisoned") = Some(1);
-        });
-        return FlowValue { task, slot };
+        return 1;
     }
 
-    let mut children = Vec::with_capacity(size);
+    let mut total = 0i32;
     for row in 0..size {
         buffer[column] = row as i8;
-        if queens_ok(&buffer, column + 1) {
-            let next = buffer.clone();
-            children.push(build_nqueens(flow, column + 1, next));
+        if queens_ok(buffer, column + 1) {
+            total += nqueens_sequential(column + 1, buffer);
+        }
+    }
+    total
+}
+
+fn nqueens_runtime(runtime: &RuntimeCtx, column: usize, buffer: Vec<i8>) -> i32 {
+    const SEQUENTIAL_REMAINING: usize = 4;
+    let size = buffer.len();
+    if size == column {
+        return 1;
+    }
+    if size - column <= SEQUENTIAL_REMAINING {
+        let mut buffer = buffer;
+        return nqueens_sequential(column, &mut buffer);
+    }
+
+    let parts = Arc::<[AtomicI32]>::from((0..size).map(|_| AtomicI32::new(0)).collect::<Vec<_>>());
+    let mut children = Vec::with_capacity(size);
+    for row in 0..size {
+        let mut next = buffer.clone();
+        next[column] = row as i8;
+
+        if queens_ok(&next, column + 1) {
+            let parts = Arc::clone(&parts);
+            children.push(runtime.executor().runtime_silent_async(move |runtime| {
+                parts[row].store(nqueens_runtime(runtime, column + 1, next), Ordering::Relaxed);
+            }));
         }
     }
 
-    if children.is_empty() {
-        let slot_for_task = Arc::clone(&slot);
-        let task = flow.spawn(move || {
-            *slot_for_task.lock().expect("nqueens slot poisoned") = Some(0);
-        });
-        return FlowValue { task, slot };
-    }
+    runtime
+        .corun_handles(&children)
+        .expect("nqueens runtime async children should succeed");
 
-    let child_slots = children.iter().map(|child| Arc::clone(&child.slot)).collect::<Vec<_>>();
-    let child_tasks = children.into_iter().map(|child| child.task).collect::<Vec<_>>();
-    let slot_for_task = Arc::clone(&slot);
-    let task = flow.spawn(move || {
-        let total = child_slots.iter().fold(0i32, |acc, slot| acc + take_slot(slot));
-        *slot_for_task.lock().expect("nqueens slot poisoned") = Some(total);
-    });
-    task.succeed(child_tasks);
-    FlowValue { task, slot }
+    parts
+        .iter()
+        .fold(0i32, |acc, value| acc + value.load(Ordering::Relaxed))
 }
 
 fn nqueens_flow(executor: &Executor, column: usize, buffer: Vec<i8>) -> Result<i32, String> {
-    let flow = Flow::new();
-    let result = build_nqueens(&flow, column, buffer);
-    executor.run(&flow).wait().map_err(|error| error.to_string())?;
-    Ok(take_slot(&result.slot))
+    executor
+        .runtime_async(move |runtime| nqueens_runtime(runtime, column, buffer))
+        .wait()
+        .map_err(|error| error.to_string())
 }
 
 fn is_prime(value: usize) -> bool {
@@ -2181,14 +2343,9 @@ fn primes_flow(executor: &Executor, limit: usize) -> Result<usize, String> {
     }))
 }
 
-fn build_skynet(flow: &Flow, base: usize, depth: usize, max_depth: usize) -> FlowValue<usize> {
-    let slot = Arc::new(Mutex::new(None));
+fn skynet_sequential(base: usize, depth: usize, max_depth: usize) -> usize {
     if depth == max_depth {
-        let slot_for_task = Arc::clone(&slot);
-        let task = flow.spawn(move || {
-            *slot_for_task.lock().expect("skynet slot poisoned") = Some(base);
-        });
-        return FlowValue { task, slot };
+        return base;
     }
 
     let mut depth_offset = 1usize;
@@ -2196,32 +2353,59 @@ fn build_skynet(flow: &Flow, base: usize, depth: usize, max_depth: usize) -> Flo
         depth_offset *= 10;
     }
 
-    let mut children = Vec::with_capacity(10);
+    let mut total = 0usize;
     for index in 0..10usize {
-        children.push(build_skynet(
-            flow,
-            base + depth_offset * index,
-            depth + 1,
-            max_depth,
-        ));
+        total += skynet_sequential(base + depth_offset * index, depth + 1, max_depth);
     }
-
-    let child_slots = children.iter().map(|child| Arc::clone(&child.slot)).collect::<Vec<_>>();
-    let child_tasks = children.into_iter().map(|child| child.task).collect::<Vec<_>>();
-    let slot_for_task = Arc::clone(&slot);
-    let task = flow.spawn(move || {
-        let total = child_slots.iter().fold(0usize, |acc, slot| acc + take_slot(slot));
-        *slot_for_task.lock().expect("skynet slot poisoned") = Some(total);
-    });
-    task.succeed(child_tasks);
-    FlowValue { task, slot }
+    total
 }
 
-fn skynet_flow(executor: &Executor, base: usize, depth: usize, max_depth: usize) -> Result<usize, String> {
-    let flow = Flow::new();
-    let result = build_skynet(&flow, base, depth, max_depth);
-    executor.run(&flow).wait().map_err(|error| error.to_string())?;
-    Ok(take_slot(&result.slot))
+fn skynet_runtime(runtime: &RuntimeCtx, base: usize, depth: usize, max_depth: usize) -> usize {
+    const SEQUENTIAL_REMAINING: usize = 2;
+    if depth == max_depth {
+        return base;
+    }
+    if max_depth.saturating_sub(depth) <= SEQUENTIAL_REMAINING {
+        return skynet_sequential(base, depth, max_depth);
+    }
+
+    let mut depth_offset = 1usize;
+    for _ in 0..max_depth.saturating_sub(depth + 1) {
+        depth_offset *= 10;
+    }
+
+    let parts =
+        Arc::<[AtomicUsize]>::from((0..10).map(|_| AtomicUsize::new(0)).collect::<Vec<_>>());
+    let mut children = Vec::with_capacity(10);
+    for index in 0..10usize {
+        let parts = Arc::clone(&parts);
+        children.push(runtime.executor().runtime_silent_async(move |runtime| {
+            parts[index].store(
+                skynet_runtime(runtime, base + depth_offset * index, depth + 1, max_depth),
+                Ordering::Relaxed,
+            );
+        }));
+    }
+
+    runtime
+        .corun_handles(&children)
+        .expect("skynet runtime async children should succeed");
+
+    parts
+        .iter()
+        .fold(0usize, |acc, value| acc + value.load(Ordering::Relaxed))
+}
+
+fn skynet_flow(
+    executor: &Executor,
+    base: usize,
+    depth: usize,
+    max_depth: usize,
+) -> Result<usize, String> {
+    executor
+        .runtime_async(move |runtime| skynet_runtime(runtime, base, depth, max_depth))
+        .wait()
+        .map_err(|error| error.to_string())
 }
 
 fn thread_pool_bench_func(loop_len: u64) -> f32 {
@@ -3070,4 +3254,54 @@ int main(int argc, char** argv) {
 "#,
     );
     source
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn exact_integral(a: f64, b: f64) -> f64 {
+        let indefinite = |x: f64| 0.25 * x * x * (x * x + 2.0);
+        indefinite(b) - indefinite(a)
+    }
+
+    fn assert_relative_error(value: f64, expected: f64) {
+        let scale = expected.abs().max(1.0);
+        let relative_error = (value - expected).abs() / scale;
+        assert!(
+            relative_error < 1.0e-9,
+            "relative error too large: value={value}, expected={expected}, relative_error={relative_error}"
+        );
+    }
+
+    #[test]
+    fn integrate_iterative_matches_closed_form() {
+        let value =
+            integrate_sequential_iterative(0.0, fn_integrate(0.0), 500.0, fn_integrate(500.0), 0.0);
+        assert_relative_error(value, exact_integral(0.0, 500.0));
+    }
+
+    #[test]
+    fn integrate_runtime_handles_large_interval() {
+        let executor = Executor::new(4);
+        let value = integrate_flow(&executor, 0.0, fn_integrate(0.0), 500.0, fn_integrate(500.0))
+            .expect("integrate flow should succeed");
+        assert_relative_error(value, exact_integral(0.0, 500.0));
+    }
+
+    #[test]
+    fn nqueens_runtime_matches_known_answer() {
+        let executor = Executor::new(4);
+        let value = nqueens_flow(&executor, 0, vec![0i8; 10]).expect("nqueens flow should succeed");
+        assert_eq!(value, 724);
+    }
+
+    #[test]
+    fn skynet_runtime_matches_closed_form() {
+        let executor = Executor::new(4);
+        let depth = 4usize;
+        let value = skynet_flow(&executor, 0, 0, depth).expect("skynet flow should succeed");
+        let leaves = 10usize.pow(depth as u32);
+        assert_eq!(value, leaves * (leaves - 1) / 2);
+    }
 }

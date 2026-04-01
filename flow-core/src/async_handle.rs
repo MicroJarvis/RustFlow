@@ -2,6 +2,7 @@ use std::sync::{Arc, Mutex};
 
 use crate::error::FlowError;
 use crate::executor::RunHandle;
+use crate::runtime::RuntimeCtx;
 
 pub struct AsyncHandle<T> {
     run_handle: RunHandle,
@@ -22,6 +23,13 @@ impl<T> AsyncHandle<T> {
 
     pub fn is_finished(&self) -> bool {
         self.run_handle.is_finished()
+    }
+
+    pub(crate) fn wait_with_runtime(self, runtime: &RuntimeCtx) -> Result<T, FlowError> {
+        runtime.corun_handle(&self.run_handle)?;
+        self.state
+            .take()
+            .ok_or_else(|| FlowError::plain("async task completed without producing a value"))
     }
 }
 

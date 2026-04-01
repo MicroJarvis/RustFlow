@@ -1,5 +1,6 @@
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Condvar, Mutex};
 use std::time::Duration;
 
 use flow_core::Executor;
@@ -41,4 +42,52 @@ fn silent_async_is_tracked_by_wait_for_all() {
     executor.wait_for_all();
 
     assert_eq!(counter.load(Ordering::SeqCst), 16);
+}
+
+#[test]
+fn silent_async_can_be_cancelled_before_it_starts() {
+    let executor = Executor::new(1);
+    let gate = Arc::new((Mutex::new(false), Condvar::new()));
+    let blocker_started = Arc::new(std::sync::atomic::AtomicBool::new(false));
+
+    {
+        let gate = Arc::clone(&gate);
+        let blocker_started = Arc::clone(&blocker_started);
+        executor.silent_async(move || {
+            blocker_started.store(true, Ordering::SeqCst);
+            let (lock, ready) = &*gate;
+            let mut released = lock.lock().expect("gate lock poisoned");
+            while !*released {
+                released = ready.wait(released).expect("gate wait poisoned");
+            }
+        });
+    }
+
+    while !blocker_started.load(Ordering::SeqCst) {
+        std::thread::yield_now();
+    }
+
+    let hit = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let handle = {
+        let hit = Arc::clone(&hit);
+        executor.silent_async(move || {
+            hit.store(true, Ordering::SeqCst);
+        })
+    };
+
+    assert!(handle.cancel(), "queued async task should be cancellable");
+
+    {
+        let (lock, ready) = &*gate;
+        let mut released = lock.lock().expect("gate lock poisoned");
+        *released = true;
+        ready.notify_all();
+    }
+
+    executor.wait_for_all();
+
+    assert!(
+        !hit.load(Ordering::SeqCst),
+        "cancelled async task should not execute"
+    );
 }

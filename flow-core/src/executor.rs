@@ -11,6 +11,8 @@ use crate::flow::{Flow, GraphSnapshot, NodeSnapshot, Subflow, TaskId, TaskKind};
 use crate::observer::Observer;
 use crate::runtime::RuntimeCtx;
 
+const WORKER_STACK_SIZE: usize = 16 * 1024 * 1024;
+
 #[derive(Clone)]
 pub struct RunHandle {
     shared: Arc<RunHandleState>,
@@ -125,7 +127,12 @@ impl Executor {
         let mut threads = inner.threads.lock().expect("executor threads poisoned");
         for worker_id in 0..worker_count {
             let inner_clone = Arc::clone(&inner);
-            threads.push(thread::spawn(move || worker_loop(worker_id, inner_clone)));
+            let thread = thread::Builder::new()
+                .name(format!("rustflow-worker-{worker_id}"))
+                .stack_size(WORKER_STACK_SIZE)
+                .spawn(move || worker_loop(worker_id, inner_clone))
+                .expect("failed to spawn executor worker thread");
+            threads.push(thread);
         }
         drop(threads);
 
@@ -215,61 +222,94 @@ impl Executor {
         F: FnOnce() -> T + Send + 'static,
         T: Send + 'static,
     {
-        let flow = Flow::new();
-        let task_slot = Arc::new(Mutex::new(Some(task)));
         let state = Arc::new(AsyncState::new());
+        let run_handle = self.schedule_async_runner(
+            Box::new({
+                let state = Arc::clone(&state);
+                move |_| {
+                    state.store(task());
+                    Ok(())
+                }
+            }),
+            None,
+        );
 
-        {
-            let task_slot = Arc::clone(&task_slot);
-            let state = Arc::clone(&state);
-            flow.spawn(move || {
-                let task = task_slot
-                    .lock()
-                    .expect("async task slot poisoned")
-                    .take()
-                    .expect("async task executed more than once");
-                state.store(task());
-            })
-            .name("async-task");
-        }
-
-        AsyncHandle::new(self.run(&flow), state)
+        AsyncHandle::new(run_handle, state)
     }
 
     pub fn silent_async<F>(&self, task: F) -> RunHandle
     where
         F: FnOnce() + Send + 'static,
     {
-        let flow = Flow::new();
-        let task_slot = Arc::new(Mutex::new(Some(task)));
-
-        {
-            let task_slot = Arc::clone(&task_slot);
-            flow.spawn(move || {
-                let task = task_slot
-                    .lock()
-                    .expect("silent async task slot poisoned")
-                    .take()
-                    .expect("silent async task executed more than once");
+        self.schedule_async_runner(
+            Box::new(move |_| {
                 task();
-            })
-            .name("silent-async");
-        }
+                Ok(())
+            }),
+            None,
+        )
+    }
 
-        self.run(&flow)
+    pub fn runtime_async<F, T>(&self, task: F) -> AsyncHandle<T>
+    where
+        F: FnOnce(&RuntimeCtx) -> T + Send + 'static,
+        T: Send + 'static,
+    {
+        let state = Arc::new(AsyncState::new());
+        let run_handle = self.schedule_async_runner(
+            Box::new({
+                let state = Arc::clone(&state);
+                move |runtime| {
+                    state.store(task(runtime));
+                    Ok(())
+                }
+            }),
+            None,
+        );
+
+        AsyncHandle::new(run_handle, state)
+    }
+
+    pub fn runtime_silent_async<F>(&self, task: F) -> RunHandle
+    where
+        F: FnOnce(&RuntimeCtx) + Send + 'static,
+    {
+        self.schedule_async_runner(
+            Box::new(move |runtime| {
+                task(runtime);
+                Ok(())
+            }),
+            None,
+        )
     }
 
     pub(crate) fn corun_inline(&self, flow: &Flow, worker_id: usize) -> Result<(), FlowError> {
         let handle = self.start_run(Arc::new(flow.snapshot()), Some(worker_id));
+        self.wait_handle_inline(&handle, worker_id)
+    }
+
+    pub(crate) fn wait_handle_inline(
+        &self,
+        handle: &RunHandle,
+        worker_id: usize,
+    ) -> Result<(), FlowError> {
+        self.wait_handles_inline(std::slice::from_ref(handle), worker_id)
+    }
+
+    pub(crate) fn wait_handles_inline(
+        &self,
+        handles: &[RunHandle],
+        worker_id: usize,
+    ) -> Result<(), FlowError> {
         let mut known_epoch = self.inner.notifier.current_epoch();
 
-        while !handle.is_finished() {
+        while handles.iter().any(|handle| !handle.is_finished()) {
             if let Some(task) = self.inner.next_task(worker_id) {
                 self.inner.execute(self, worker_id, task);
                 continue;
             }
 
-            if handle.is_finished() {
+            if handles.iter().all(RunHandle::is_finished) {
                 break;
             }
 
@@ -278,7 +318,11 @@ impl Executor {
                 .wait(&mut known_epoch, &self.inner.shutdown);
         }
 
-        handle.wait()
+        for handle in handles {
+            handle.wait()?;
+        }
+
+        Ok(())
     }
 
     fn start_run(&self, snapshot: Arc<GraphSnapshot>, worker_hint: Option<usize>) -> RunHandle {
@@ -315,6 +359,20 @@ impl Executor {
 
         handle
     }
+
+    pub(crate) fn schedule_async_runner(
+        &self,
+        runner: Box<dyn FnOnce(&RuntimeCtx) -> Result<(), FlowError> + Send + 'static>,
+        worker_hint: Option<usize>,
+    ) -> RunHandle {
+        let handle = RunHandle::pending();
+        self.inner.increment_active_runs();
+        self.inner.enqueue_async(
+            ScheduledAsyncTask::new(runner, handle.clone()),
+            worker_hint,
+        );
+        handle
+    }
 }
 
 impl Drop for Executor {
@@ -339,22 +397,22 @@ impl Drop for Executor {
 
 #[derive(Default)]
 struct WorkerQueue {
-    tasks: Mutex<VecDeque<ScheduledTask>>,
+    tasks: Mutex<VecDeque<ScheduledWork>>,
 }
 
 impl WorkerQueue {
-    fn push_back(&self, task: ScheduledTask) {
+    fn push_back(&self, task: ScheduledWork) {
         self.tasks
             .lock()
             .expect("worker queue poisoned")
             .push_back(task);
     }
 
-    fn pop_back(&self) -> Option<ScheduledTask> {
+    fn pop_back(&self) -> Option<ScheduledWork> {
         self.tasks.lock().expect("worker queue poisoned").pop_back()
     }
 
-    fn steal_front(&self) -> Option<ScheduledTask> {
+    fn steal_front(&self) -> Option<ScheduledWork> {
         self.tasks
             .lock()
             .expect("worker queue poisoned")
@@ -450,14 +508,22 @@ impl ExecutorInner {
 
     fn schedule(&self, task: ScheduledTask, worker_hint: Option<usize>) {
         task.run.outstanding.fetch_add(1, Ordering::AcqRel);
-        self.enqueue(task, worker_hint);
+        self.enqueue_graph(task, worker_hint);
     }
 
     fn schedule_precounted(&self, task: ScheduledTask, worker_hint: Option<usize>) {
-        self.enqueue(task, worker_hint);
+        self.enqueue_graph(task, worker_hint);
     }
 
-    fn enqueue(&self, task: ScheduledTask, worker_hint: Option<usize>) {
+    fn enqueue_graph(&self, task: ScheduledTask, worker_hint: Option<usize>) {
+        self.enqueue(ScheduledWork::Graph(task), worker_hint);
+    }
+
+    fn enqueue_async(&self, task: ScheduledAsyncTask, worker_hint: Option<usize>) {
+        self.enqueue(ScheduledWork::Async(task), worker_hint);
+    }
+
+    fn enqueue(&self, task: ScheduledWork, worker_hint: Option<usize>) {
         let worker_id = worker_hint.unwrap_or_else(|| {
             self.next_worker.fetch_add(1, Ordering::Relaxed) % self.worker_count
         });
@@ -474,13 +540,13 @@ impl ExecutorInner {
             let worker_id = worker_hint.unwrap_or_else(|| {
                 self.next_worker.fetch_add(1, Ordering::Relaxed) % self.worker_count
             });
-            self.workers[worker_id].push_back(waiter);
+            self.workers[worker_id].push_back(ScheduledWork::Graph(waiter));
         }
 
         self.notifier.notify_all();
     }
 
-    fn next_task(&self, worker_id: usize) -> Option<ScheduledTask> {
+    fn next_task(&self, worker_id: usize) -> Option<ScheduledWork> {
         if let Some(task) = self.workers[worker_id].pop_back() {
             return Some(task);
         }
@@ -498,7 +564,14 @@ impl ExecutorInner {
         None
     }
 
-    fn execute(&self, executor: &Executor, worker_id: usize, scheduled: ScheduledTask) {
+    fn execute(&self, executor: &Executor, worker_id: usize, scheduled: ScheduledWork) {
+        match scheduled {
+            ScheduledWork::Graph(task) => self.execute_graph(executor, worker_id, task),
+            ScheduledWork::Async(task) => self.execute_async(executor, worker_id, task),
+        }
+    }
+
+    fn execute_graph(&self, executor: &Executor, worker_id: usize, scheduled: ScheduledTask) {
         let node = &scheduled.run.graph.nodes[scheduled.task_index];
 
         if scheduled.run.is_cancelled() {
@@ -576,6 +649,34 @@ impl ExecutorInner {
         self.finish_task(&scheduled);
     }
 
+    fn execute_async(&self, executor: &Executor, worker_id: usize, mut scheduled: ScheduledAsyncTask) {
+        if scheduled
+            .run_handle
+            .cancelled_flag()
+            .load(Ordering::Acquire)
+        {
+            scheduled.run_handle.complete(Ok(()));
+            self.decrement_active_runs();
+            self.notifier.notify_all();
+            return;
+        }
+
+        let runner = scheduled
+            .runner
+            .take()
+            .expect("async runner scheduled more than once");
+        let cancelled = scheduled.run_handle.cancelled_flag();
+        let runtime = RuntimeCtx::new(executor.clone(), worker_id, None, cancelled);
+        let result = match panic::catch_unwind(AssertUnwindSafe(|| runner(&runtime))) {
+            Ok(result) => result,
+            Err(payload) => Err(FlowError::plain(panic_payload_to_string(payload))),
+        };
+
+        scheduled.run_handle.complete(result);
+        self.decrement_active_runs();
+        self.notifier.notify_all();
+    }
+
     fn finish_task(&self, scheduled: &ScheduledTask) {
         let node = &scheduled.run.graph.nodes[scheduled.task_index];
         scheduled.run.pending[scheduled.task_index]
@@ -627,6 +728,28 @@ impl ExecutorInner {
 pub(crate) struct ScheduledTask {
     run: Arc<RunState>,
     task_index: usize,
+}
+
+enum ScheduledWork {
+    Graph(ScheduledTask),
+    Async(ScheduledAsyncTask),
+}
+
+struct ScheduledAsyncTask {
+    run_handle: RunHandle,
+    runner: Option<Box<dyn FnOnce(&RuntimeCtx) -> Result<(), FlowError> + Send + 'static>>,
+}
+
+impl ScheduledAsyncTask {
+    fn new(
+        runner: Box<dyn FnOnce(&RuntimeCtx) -> Result<(), FlowError> + Send + 'static>,
+        run_handle: RunHandle,
+    ) -> Self {
+        Self {
+            run_handle,
+            runner: Some(runner),
+        }
+    }
 }
 
 struct RunState {

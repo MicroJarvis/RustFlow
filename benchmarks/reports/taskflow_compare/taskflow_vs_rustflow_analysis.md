@@ -2,427 +2,143 @@
 
 - 日期：2026-04-01
 - 对应报告：`benchmarks/reports/taskflow_compare/taskflow_vs_rustflow_report.md`
-- 分析范围：仅分析报告中 `RustFlow` 慢于 `Taskflow` 的测试用例
+- 配置：`threads=4`，`rounds=1`
+- 分析口径：优先看趋势，不放大小尺寸点位上的单次抖动
 
-## 总结
+## 当前结论
 
-当前报告里 RustFlow 落后的用例，不是由单一原因造成的，主要可以归纳为四类：
+这轮对齐和优化之后，结论已经和上一版明显不同：
 
-1. RustFlow 在超细粒度任务场景下，固定调度开销偏高。
-2. RustFlow 目前缺少轻量级的运行时递归执行路径，导致分治类任务表现较差。
-3. RustFlow 当前的 pipeline 实现比 Taskflow 更重。
-4. 少数 Rust 侧 benchmark 适配并不完全等价于原始 Taskflow benchmark，因此把额外的分配和同步成本也计入了测试结果。
+1. `integrate` 基本解决。
+   现在只有 `size=0` 这个纯固定开销点仍慢于 Taskflow，`100..500` 全部领先，比例大约在 `0.17x..0.23x`。
+2. `skynet` 已经整体领先。
+   四个测试点全部快于 Taskflow，比例大约在 `0.09x..0.82x`。
+3. `nqueens` 已经从“大幅落后”收敛到“只在尾部规模落后”。
+   `1..8` 大多领先，`9` 和 `10` 仍分别慢约 `1.68x` 和 `1.96x`。
+4. `for_each` 和 `black_scholes` 的 benchmark 适配已经明显更接近 Taskflow 原始 workload。
+   `for_each` 在 `10k` 已领先，在 `100k` 基本打平；`black_scholes` 仍慢，但差距已经压到 `3.5x..4.5x`，不再是之前那种由 adapter 放大的失真结果。
 
-这份报告同时也给了一个重要的反向信号：RustFlow 并不是在所有 CPU 并行计算任务上都慢于 Taskflow。`mandelbrot` 基本打平，`matrix_multiplication` 在当前报告里甚至更快。这说明主要问题不在于“Rust 做数值计算天然更慢”，而在于细粒度调度路径和 pipeline 路径目前还不够轻。
+因此，当前真正还需要优先解决的，不再是“递归 benchmark 全面失守”，而是下面三类问题。
 
-## 整体结论
+## 仍然落后的三大类
 
-### 1. 超小任务暴露了 RustFlow 的固定开销
+### 1. 超细粒度任务的固定调度成本仍然偏高
 
-最明显的模式出现在 `async_task`、`embarrassing_parallelism`、`binary_tree`、`linear_chain` 和 `graph_traversal` 这些用例上。
+最典型的仍然是这些 case：
 
-这些 workload 的特点是：
+- `async_task`：17/17 点落后，最差约 `30.3x`
+- `linear_chain`：16/16 点落后，最差约 `10.5x`
+- `embarrassing_parallelism`：17/17 点落后，最差约 `4.0x`
+- `binary_tree`：14/14 点落后，最差约 `5.2x`
+- `graph_traversal`：6/7 点落后，最差约 `3.0x`
+- `thread_pool`：5/5 点落后，最差约 `5.7x`
 
-- 单个 task 的有效工作量很小
-- benchmark 更像是在测调度器本身，而不是测计算核
+这些 workload 的共同点很明确：
 
-在这种场景下，真正主导总耗时的往往不是 task body，而是每个 task 的控制成本，例如：
+- 单 task 几乎没有计算量
+- benchmark 主要在测 scheduler 自身
+- 固定成本比真实计算更主导总时间
 
-- task 包装和闭包管理
-- 依赖关系记录
-- run handle 创建
-- 图快照构建
-- worker 唤醒和工作入队
+前两轮已经做了 one-off async fast path，但从结果看，RustFlow 在以下路径上仍然偏重：
 
-RustFlow 在这类固定成本上的负担目前明显高于 Taskflow。
+- async task 创建和提交
+- run handle 生命周期管理
+- worker 唤醒和队列交互
+- 小任务下的跨线程同步
 
-尤其是 `Executor::async_task` 和 `Executor::silent_async`，并不是直接把一个 runnable task 入 executor 队列，而是先临时创建一个单节点 `Flow`，然后再走完整的 flow 执行路径。也就是说，即便只是一个一次性的异步任务，当前也要额外支付：
+这仍然是第一优先级，因为它同时影响多个 benchmark，而不是单一 case。
 
-- `Flow::new`
-- 向 flow 图中插入 task
-- graph snapshot 构建
-- run state 初始化
-- root task 调度
+### 2. 运行时递归能力已经补上，但 `fibonacci` 仍然没有过关
 
-这条路径的直接结果就是 `async_task` 很差，同时也会拖慢一切以小 task 为主的 benchmark。
+当前递归类 case 已经分化：
 
-### 2. 分治递归场景是“整棵 DAG 先建完再执行”
+- `integrate`：已解决
+- `skynet`：已反超
+- `nqueens`：只剩大尺寸尾部落后
+- `fibonacci`：19/20 点落后，最差约 `47.6x`
 
-`fibonacci` 和 `integrate` 是当前差距最大的两类用例。这里的问题不是一句“Taskflow 更优化”就能概括，而是两边使用了不同的执行模型。
+这说明“有没有运行时递归接口”已经不是主要问题，真正剩下的是 `fibonacci` 这种极端细粒度递归树上的路径成本。
 
-Taskflow 使用的是运行时递归：
+`fibonacci` 的特点是：
 
-- 一边分支异步提交
-- 另一边分支由当前 worker 继续计算
-- 最后通过 `corun` 避免 worker 在等待子任务时空转
+- 节点数指数爆炸
+- 每个节点几乎没有有效工作
+- 运行时递归本身的调度、句柄、等待成本被放大到极致
 
-RustFlow 当前采用的是另一种模式：
+也就是说，`fibonacci` 现在更像是“递归 tiny-task scheduler benchmark”，不是普通分治 benchmark。下一步要优化它，方向应该是：
 
-- 先递归构建完整的 `Flow`
-- 把整棵递归树全部表示成 DAG
-- 然后再统一交给 executor 执行
+- 继续压低 `runtime_async` / `runtime_silent_async` 的提交成本
+- 减少递归等待路径里的 handle 开销
+- 考虑更 work-first 的递归调度策略，而不是继续堆通用句柄语义
 
-这会让 RustFlow 在一个 benchmark 中同时承担三类成本：
+如果这条线不做，`fibonacci` 还会长期停留在红区。
 
-- 递归建图成本
-- 每个节点的依赖和 handle 成本
-- 中间结果存储与汇总成本
+### 3. 算法层实现仍有几组明显短板
 
-当前 `fibonacci` 和 `integrate` 的 Rust 版本里，还为每个结果节点分配了 `Arc<Mutex<Option<T>>>` 类型的 slot，用于在父节点中合并左右子树结果。这样做逻辑上没有问题，但对这种高扇出、高节点数的递归 workload 来说会明显重于 Taskflow 的运行时递归路径。
+当前报告里还有几组持续落后的算法 case：
 
-因此，`fibonacci` 和 `integrate` 更适合被理解为：RustFlow 当前还没有低成本的运行时递归接口，而不是“RustFlow 对所有 DAG 都比 Taskflow 慢 50 倍”。
+- `scan`：5/5 点落后，最差约 `13.5x`
+- `sort`：5/5 点落后，最差约 `10.8x`
+- `primes`：4/5 点落后，最差约 `7.8x`
+- `wavefront`：6/6 点落后，最差约 `7.9x`
+- `merge_sort`：5/5 点落后，最差约 `2.0x`
+- `data_pipeline`：9/10 点落后，最差约 `3.4x`
+- `graph_pipeline`：4/5 点落后，最差约 `2.2x`
 
-### 3. Pipeline 路径的实现偏重
+这类问题和前面的 scheduler 固定开销不同，更偏算法实现本身：
 
-`data_pipeline` 和 `graph_pipeline` 主要暴露的是 pipeline 路径的额外开销。
+- `scan` / `sort` 说明当前 parallel algorithm 路径还不够轻
+- `wavefront` 和 `graph_pipeline` 说明 pipeline / wavefront 组合下的框架成本还偏高
+- `primes` 说明当前切块和聚合方式对轻计算 kernel 不够友好
 
-RustFlow 这边有两个主要问题：
+这一组应该作为第二优先级处理，因为它们覆盖的是“算法库质量”，不是 core executor 的基本面。
 
-- `Pipeline::run` 和 `DataPipeline::run` 会先通过 `spawn_run_handle` 额外起一个协调线程
-- `DataPipeline` 在 stage 间传递 payload 时使用 `Box<dyn Any + Send>`，会引入装箱、类型擦除、downcast 和 repeated payload reconstruction
+## 已经验证有效的改动
 
-而 Taskflow 的 pipeline benchmark 更接近静态类型的 pipeline 链。
+这轮已经证明有效的方向有三条：
 
-这个差异在 `data_pipeline` 里尤其明显，因为它的 payload 会在八个 serial stage 之间反复变换类型。RustFlow 这边相当于每经过一站都要做：
+1. benchmark adapter 必须尽量和 Taskflow 原始 workload 对齐。
+   `for_each`、`black_scholes` 的结果已经证明，之前一部分差距确实是 adapter 自己放大的。
+2. runtime 递归必须有 worker 内联等待能力。
+   没有它，`integrate` 和 `fibonacci` 这类 case 根本不在一个量级上。
+3. 深层小任务必须允许顺序回退。
+   `integrate` 的栈问题、`nqueens` / `skynet` 的任务风暴问题，都是靠“上层并行、深层顺序”才真正收住。
 
-- box
-- downcast
-- 重新 box
+## 下一阶段建议
 
-对于本身 stage work 并不算重的 benchmark 来说，这部分框架成本会非常显眼。
+### P0：继续压 executor 的 tiny-task 固定成本
 
-`graph_pipeline` 也是同样的情况，只不过它从另一个角度说明了这个问题：当 compute kernel 本身不够重时，pipeline framework 的开销就更容易被直接放大到最终结果里。
-
-### 4. 少数 benchmark 当前并不是完全 apples-to-apples
-
-这份报告依然有价值，但有几项 benchmark 不能直接被理解为“纯 runtime 对比”。
-
-最重要的两个例子是：
-
-- `for_each`
-- `black_scholes`
-
-在这两项里，RustFlow 并不是仅仅“做同样的事但调度器更慢”。更准确地说，是 Rust 侧 benchmark adapter 改变了 workload 结构，从而把额外的分配、收集和聚合成本也一起测进去了。
-
-因此，这两个 benchmark 的慢值里，既有 runtime 因素，也有 benchmark 适配差异带来的放大效应。
-
-## 分用例分析
-
-### `async_task`
-
-这是最纯粹的 runtime 固定开销 benchmark。
-
-Taskflow 的 benchmark 做法是：
-
-- 循环调用 `executor.silent_async(...)`
-- 最后用 `executor.wait_for_all()` 等待全部完成
-
-RustFlow 的 benchmark 表面上也是调用 `executor.silent_async(...)`，但 RustFlow 当前的 `silent_async` 内部并不是直接入线程池，而是临时构造一个单节点 `Flow`，再通过普通 flow 执行路径去跑。
-
-根因：
-
-- RustFlow 目前没有 one-off async task 的 direct fast path
-
-判断：
-
-- 这是 runtime 本身的真实瓶颈
-- 不属于 benchmark 不公平问题
-
-### `binary_tree`
-
-这个 benchmark 里的 task 几乎没有实质工作，主要就是计数器加一。因此它比的几乎就是“建图 + 依赖处理 + 调度”的纯成本。
-
-RustFlow 慢的原因主要有：
-
-- 图在 Rust 侧动态构建
-- 每轮执行前还要生成 graph snapshot
-- 小 task 仍然要走完整的 flow 执行流程
-
-判断：
-
-- 这是典型的 runtime 固定成本问题
-- 对大量细粒度 DAG 用户也有现实意义
-
-### `black_scholes`
-
-这个 benchmark 之所以慢，至少有两个因素叠加。
-
-第一，RustFlow 这边走的是 `parallel_transform`，而当前 `parallel_transform` 会：
-
-- 新建一个 `Flow`
-- 切 chunk
-- 分配输出容器
-- 用 `Mutex<Option<_>>` 逐元素存储输出
-- 最后再把所有结果收集回 `Vec`
-
-第二，Taskflow 原 benchmark 的结构更有利。它会在一个 taskflow graph 内部循环运行，并直接把结果写入预分配好的数组。RustFlow 这边则是在外层重复调用 `parallel_transform`，之后再做 checksum 聚合。
-
-这意味着 RustFlow 不只是慢在 scheduler 上，还额外承担了 adapter 层的分配和收集成本。
-
-判断：
-
-- 一部分是 `parallel_transform` 路径本身太重
-- 一部分是 benchmark 适配方式不完全等价
-
-### `data_pipeline`
-
-这个 benchmark 主要暴露的是 pipeline 实现本身的成本，而不是 core executor 的问题。
-
-RustFlow 当前 `DataPipeline` 的主要负担包括：
-
-- `Box<dyn Any + Send>` 的动态 payload 传递
-- 每个 stage 边界的 downcast
-- run 级别额外协调线程
-
-Taskflow 的 pipeline 更接近静态类型链，因此路径明显更短。
-
-判断：
-
-- 这是 RustFlow pipeline 设计上的真实性能问题
-- 不能简单外推为“RustFlow executor 整体都慢”
-
-### `embarrassing_parallelism`
-
-这个 benchmark 的主导因素仍然是 tiny-task 调度开销。
-
-Taskflow 那边基本只执行 `dummy(i)`。RustFlow 这边虽然 compute kernel 本身相近，但每个 task 还会额外执行一次原子加法来累加 checksum。这个原子操作不是主要瓶颈，但它确实属于额外工作，而且发生在计时区间内。
-
-判断：
-
-- 主要是细粒度调度问题
-- 次要地被 benchmark 侧的 checksum 逻辑略微放大
-
-### `fibonacci`
-
-这是执行模型差异最明显的 benchmark 之一。
-
-Taskflow 的做法是：
-
-- 用 `task_group` 做运行时递归
-- 只把一侧分支异步提交
-- 另一侧在当前 worker 内继续计算
-- 通过 `corun` 让 worker 在等待时保持工作
-
-RustFlow 的做法是：
-
-- 先递归构建完整 DAG
-- 给每个结果节点分配一个 slot
-- 父节点再从子节点 slot 中取值并合并
-
-判断：
-
-- 这是运行时递归支持缺失导致的真实能力差距
-- 不能据此推出“所有 RustFlow 图都这么慢”
-
-### `for_each`
-
-这是当前报告里最不公平的 benchmark 之一。
-
-Taskflow benchmark 的工作是：
-
-- 对全局 vector 做原地 `tan` 变换
-
-RustFlow benchmark 的工作则是：
-
-- 创建输入 vector
-- 填充随机值
-- 调用 `parallel_transform`
-- 分配新的输出 vector
-- 对输出做 checksum
-
-这两边实际上已经不是同一个 workload。
-
-判断：
-
-- 不能把它直接当作纯 scheduler 对比
-- 当前大幅落后很大程度上是 benchmark adapter 结构差异造成的
-
-### `graph_pipeline`
-
-这个 benchmark 展示的是多阶段 pipeline 下的框架成本。
-
-比较关键的一点是：RustFlow 的 compute kernel 并不明显比 C++ 参考实现更重。但在这种情况下，RustFlow 依然稳定慢约 1.8x 到 2.0x，说明瓶颈并不在 kernel，而在外围框架。
-
-主要原因：
-
-- pipeline 协调成本
-- line 级任务启动成本
-- atomic buffer 和 value handoff
-
-判断：
-
-- 这是 pipeline 实现层的真实问题
-
-### `graph_traversal`
-
-这也是典型的小任务 DAG benchmark。
-
-由于 task body 被刻意设计得比较轻，因此 benchmark 会放大以下成本：
-
-- 图构建成本
-- 图快照成本
-- task 调度成本
-- visited 状态管理成本
-
-RustFlow 还使用了原子 visited 数组，而 Taskflow 的 reference graph 是把 visited 状态直接存在 node 对象内部。
-
-判断：
-
-- 这是细粒度 DAG 下的真实 runtime 开销问题
-
-### `integrate`
-
-`integrate` 和 `fibonacci` 属于同一类结构问题，但通常更重，因为递归树规模会随着区间和误差条件迅速膨胀。
-
-Taskflow 使用运行时递归加 `corun`，避免先建完整递归树。
-
-RustFlow 这边则是：
-
-- 先建完整递归 flow
-- 为大量节点分配结果 slot
-- 在真正算完之前先承担很重的建图和同步成本
-
-判断：
-
-- 这是运行时递归执行能力的真实差距
-
-### `linear_chain`
-
-这是最容易暴露固定调度成本的 DAG 之一。
-
-原因很简单：linear chain 几乎没有可利用的并行度，任何时刻通常只有一个 runnable task。这样一来，调度开销就无法被宽前沿并行摊薄。
-
-Taskflow 还使用了 `linearize` helper，而 RustFlow 这边仍然通过普通依赖推进链条逐个推进执行。
-
-判断：
-
-- 这是 runtime 固定成本偏高的典型表现
-
-### `linear_pipeline`
-
-这个 benchmark 需要和前面两个 pipeline 慢项区分来看。
-
-除了最小的 size 点外，RustFlow 和 Taskflow 基本接近持平。这说明在 steady-state 下，这条 pipeline 路径并不是灾难性落后。
-
-最小点偏慢，主要更像是启动成本问题，例如：
-
-- 协调线程创建
-- line worker 启动
-- stop 传播成本
-
-判断：
-
-- 属于小问题
-- 目前不是最高优先级
-
-## 分类归纳
-
-### A. 真实的 runtime 固定开销问题
+先盯这几个 benchmark：
 
 - `async_task`
-- `binary_tree`
 - `linear_chain`
-- `graph_traversal`
+- `thread_pool`
+- `binary_tree`
+- `embarrassing_parallelism`
 
-### B. 运行时递归能力缺口
+这组 case 的回报最高，因为一个 runtime 优化会同时反映到多项数据上。
 
-- `fibonacci`
-- `integrate`
+### P1：专项处理 `fibonacci`
 
-### C. Pipeline 实现偏重
+目标不是再加一个新接口，而是把现有 runtime recursion 路径做轻：
 
-- `data_pipeline`
-- `graph_pipeline`
-- `linear_pipeline` 的小规模点
+- 更少的句柄对象
+- 更少的等待层级
+- 更偏 work-first 的递归执行
 
-### D. 当前 benchmark 适配放大了差距
+`fibonacci` 目前仍然是整份报告里最醒目的红项之一。
 
-- `for_each`
-- `black_scholes`
-- 次一级是 `embarrassing_parallelism`
+### P2：重做 `scan` / `sort` / `wavefront`
 
-## 优先级建议
+从报告看，这三项已经比 pipeline 更值得优先拿下：
 
-### 优先级 1：先修 benchmark 公平性
+- `scan` 和 `sort` 的倍数仍然过大
+- `wavefront` 在所有点位都稳定落后
 
-在真正优化 runtime 之前，建议先把最明显不公平的 benchmark adapter 改成更接近原始 Taskflow benchmark 的结构。
+如果只做 scheduler 层优化，这三项不会自然好起来。
 
-建议改动：
+## 一句话判断
 
-- `for_each` 改为原地 `parallel_for`，不要再走 `parallel_transform + checksum`
-- `black_scholes` 改为写入预分配输出 buffer，并尽量匹配 Taskflow 的 `NUM_RUNS` 内部循环结构
-- 纯校验性质的 checksum 尽量移出计时区，或保证两边做完全同等的校验工作
+RustFlow 现在的主要矛盾已经从“缺少递归执行能力”转成“tiny-task 调度成本过高 + 若干算法实现还偏重”。
 
-收益：
-
-- 先剥离“假的差距”
-- 后续优化前后的报告会更可信
-
-### 优先级 2：给 async 补 direct fast path
-
-为 `async_task` 和 `silent_async` 增加直接入队 executor 的路径，不再为每个 one-off async 临时创建 `Flow`。
-
-收益：
-
-- `async_task` 会直接改善
-- `linear_chain`、`binary_tree`、`embarrassing_parallelism`、`graph_traversal` 也会明显受益
-
-### 优先级 3：补运行时递归接口
-
-增加一个类似 Taskflow `task_group + corun` 的轻量运行时递归机制。
-
-收益：
-
-- `fibonacci` 会有决定性改善
-- `integrate` 会有决定性改善
-
-### 优先级 4：瘦身 `parallel_transform`
-
-当前实现的主要问题是：
-
-- 每个输出元素一个 `Mutex<Option<U>>`
-- 输出完成后还要重新收集成 `Vec`
-- auto chunk 策略依据机器总并发度，而不是当前 executor worker 数
-
-其中最后一点尤其值得注意：当前 `ParallelForOptions::Auto` 基于 `available_parallelism` 分 chunk，而 benchmark 报告用的是固定 4 个 worker。如果宿主机逻辑核更多，就会切出比实际 executor 更碎的 chunk。
-
-收益：
-
-- `for_each` 会改善
-- `black_scholes` 会改善
-- 其他 transform 类算法也会受益
-
-### 优先级 5：继续优化 pipeline
-
-比较大的结构性收益点包括：
-
-- 去掉 `Pipeline::run` / `DataPipeline::run` 的额外协调线程
-- 避免 `Box<dyn Any + Send>` 的动态 payload 路径
-- 降低 serial stage 的同步和 bookkeeping 成本
-
-收益：
-
-- `data_pipeline` 会明显改善
-- `graph_pipeline` 会明显改善
-- `linear_pipeline` 的启动成本也会下降
-
-## 最终判断
-
-当前报告并不支持“RustFlow 在 CPU 并行计算上普遍慢于 Taskflow”这个结论。它更准确地说明了三件事：
-
-- RustFlow 在超细粒度任务上的固定成本偏高
-- RustFlow 还缺少适合分治递归的运行时执行接口
-- RustFlow 的 pipeline 路径还不够轻
-
-同时，报告里也有两类 benchmark 当前确实把 Rust 侧 adapter 的额外工作测进去了：
-
-- `for_each`
-- `black_scholes`
-
-因此，最值得的下一步顺序是：
-
-1. 先修 benchmark 等价性
-2. 再给 executor async 增加 direct fast path
-3. 最后再根据新的报告决定递归和 pipeline 优化的优先级细节
-
-这个顺序既能先把报告里的“伪差距”剥掉，也能最快压低当前最显眼的红项。
+这意味着下一步不该再平均撒网，而应该先打掉 `async_task / fibonacci / scan / sort` 这四条主线。
