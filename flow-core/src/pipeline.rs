@@ -526,11 +526,9 @@ fn run_pipe_line(
             *next_token += 1;
         }
 
+        // Once a line has claimed a token from stage 0, let it drain through the
+        // remaining stages before honoring a global stop or cancellation request.
         for pipe_index in 1..pipes.len() {
-            if run_state.should_stop() {
-                return Ok(());
-            }
-
             context.pipe = pipe_index;
             if let Some(stage_lock) = &run_state.stage_locks[pipe_index] {
                 let _stage_guard = lock_unpoisoned(stage_lock);
@@ -611,11 +609,9 @@ fn run_data_line(
             payload
         };
 
+        // Once a line has claimed a token from stage 0, let it drain through the
+        // remaining stages before honoring a global stop or cancellation request.
         for pipe_index in 1..stages.len() {
-            if run_state.should_stop() {
-                return Ok(());
-            }
-
             context.pipe = pipe_index;
             if let Some(stage_lock) = &run_state.stage_locks[pipe_index] {
                 let _stage_guard = lock_unpoisoned(stage_lock);

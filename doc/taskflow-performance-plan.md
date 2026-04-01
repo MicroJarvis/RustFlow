@@ -7,116 +7,101 @@
 - [RustFlow vs Taskflow Benchmark Report](../benchmarks/reports/taskflow_compare/taskflow_vs_rustflow_report.md)
 - [RustFlow vs Taskflow Analysis](../benchmarks/reports/taskflow_compare/taskflow_vs_rustflow_analysis.md)
 
-报告说明，RustFlow 目前的主要性能短板不是数值计算内核本身，而是：
+截至 2026-04-01，这份计划不再按最早版本的“阶段 1 到阶段 5 原样推进”，而是基于最新报告和当前代码状态重新整理：
 
-- benchmark 适配层有少数 case 不是完全等价
-- one-off async task 的固定开销偏高
-- 缺少轻量运行时递归执行路径
-- pipeline 路径仍然偏重
+- 一部分原计划工作已经落地
+- 当前主要矛盾已经发生变化
+- 接下来更重要的是按收益排序继续压关键红项
 
-这份计划的目标是把上述结论收敛成可执行的阶段路线，而不是继续停留在结论层。
+这份文档的目标，是把“当前还需要做什么”写成和仓库现状一致的开发路线，而不是保留已经过时的待办列表。
 
-## 基线结论
+## 当前判断
 
-当前最需要关注的基线点如下：
+当前的总体判断仍然成立：
 
-- `async_task`：大多数点落后约 3x 到 7x
-- `linear_chain`：大多数点落后约 8x 到 11x
-- `binary_tree`：大多数点落后约 2x 到 5x
-- `for_each`：大点位落后约 13x 到 25x
-- `black_scholes`：落后约 11x 到 14x
-- `fibonacci`：大点位落后约 41x 到 56x
-- `integrate`：落后约 57x 到 72x
-- `data_pipeline`：落后约 2.6x 到 3.1x
-- `graph_pipeline`：落后约 1.8x 到 2.1x
+- 不需要笼统地“全面重写 runtime”
+- 需要按瓶颈类型逐项处理
+- 先打掉固定成本最高、收益最广的路径
+- 再处理算法层和 pipeline 的结构性开销
 
-同时也要明确两件事：
+但和最早一版计划相比，今天的重点已经不是：
 
-- `mandelbrot` 基本打平
-- `matrix_multiplication` 当前甚至优于 Taskflow
+- benchmark 适配普遍不等价
+- 缺少 runtime recursion 能力
 
-所以接下来不应该笼统地“全面重写 runtime”，而应该按瓶颈分类逐项处理。
+而是：
 
-## 总体策略
+- tiny-task 调度固定成本仍然偏高
+- `fibonacci` 这类极端细粒度递归树仍然很重
+- `scan` / `sort` / `primes` / `wavefront` / pipeline 等算法层实现仍偏重
 
-执行顺序固定为：
+## 已完成的工作
 
-1. 先修 benchmark 等价性
-2. 再降低 executor 固定开销
-3. 再补运行时递归能力
-4. 再收紧算法层分配和 chunk 策略
-5. 最后处理 pipeline 结构性开销
+下面这些方向已经不是“待设计”，而是已经在代码中落地并被最新报告验证过：
 
-这样安排有两个原因：
+### 1. benchmark adapter 对齐
 
-- 先把伪差距剥离，后续报告才可信
-- 先解决固定成本，能最快压低最显眼的一批红项
+- `for_each` 已改成原地并行遍历
+- `black_scholes` 已改成写入预分配输出 buffer
+- 这两项的结果已经比旧报告更接近 Taskflow 原始 workload
 
-## 阶段 0：基线和验收方式
+### 2. one-off async fast path
 
-目标：建立固定复测口径，避免每次改动后只凭主观判断。
+- `Executor::async_task`
+- `Executor::silent_async`
+- dependent async 的内部调度
 
-任务：
+这些路径都已经直接进入 executor queue，不再先为 one-off async 构造临时 `Flow`。
 
-- 固定专项基线文档，不覆盖历史结果
-- 建立一组最小复测集
-- 约定每个阶段结束后的验收标准
+### 3. runtime recursion 基础能力
 
-最小复测集：
+- `RuntimeCtx` 已经具备 `corun` / `corun_handle` / `corun_handles`
+- worker 等待子任务时已经可以继续工作
+- benchmark 中的 `fibonacci` / `integrate` / `nqueens` / `skynet` 已经切到 runtime recursion 路径
+
+### 4. 已验证有效的策略
+
+当前结果已经证明下面几条方向是对的：
+
+- benchmark adapter 要尽量与 Taskflow 原 benchmark 对齐
+- runtime recursion 必须支持 worker 内联等待
+- 深层递归必须允许顺序回退，避免任务风暴和栈问题
+
+## 最新基线结论
+
+截至最新分析，现状可以概括为：
+
+### 已明显收敛或已领先
+
+- `integrate`：基本解决
+- `skynet`：整体领先
+- `nqueens`：只在大尺寸尾部落后
+- `for_each`：大点位已接近打平
+- `mandelbrot`：基本打平
+- `matrix_multiplication`：当前领先
+
+### 仍然最值得优先处理
 
 - `async_task`
 - `linear_chain`
 - `binary_tree`
-- `for_each`
-- `black_scholes`
+- `embarrassing_parallelism`
+- `thread_pool`
 - `fibonacci`
-- `integrate`
+- `scan`
+- `sort`
+- `primes`
+- `wavefront`
 - `data_pipeline`
 - `graph_pipeline`
 
-阶段性要求：
+## 开发主线
 
-- 每个阶段结束后先跑最小复测集
-- 阶段完成后再跑全量对比
-- 报告中必须保留旧基线和新结果的可比描述
+接下来建议固定按下面四条主线推进，而不是回到旧版阶段顺序。
 
-完成标准：
+### P0：继续压 executor 的 tiny-task 固定成本
 
-- 后续每一轮优化都能明确回答“哪个 case 变快了，哪个 case 没变”
-
-## 阶段 1：修 benchmark 等价性
-
-目标：先消除最明显的 apples-to-apples 问题。
-
-优先 case：
-
-- `for_each`
-- `black_scholes`
-
-涉及文件：
-
-- `benchmarks/src/bin/taskflow_compare.rs`
-
-具体改动：
-
-- `for_each` 从 `parallel_transform + checksum` 改成原地并行遍历
-- `black_scholes` 改成写入预分配输出 buffer
-- 尽量匹配 Taskflow benchmark 的内部循环结构，而不是在 Rust 侧额外引入分配和收集
-- 纯校验性质的 checksum 尽量移出计时区，或者保证两边做完全相同的校验
-
-验收标准：
-
-- `for_each` 和 `black_scholes` 的 ratio 明显下降
-- 新报告里这两个 case 不再混入 Rust 侧额外 adapter 成本
-
-风险：
-
-- 如果改动过度，可能会让 Rust 版 workload 偏离 Taskflow 原 benchmark
-- 必须保留与 Taskflow benchmark 语义一致的输入生成和结果校验
-
-## 阶段 2：给 executor 增加 async fast path
-
-目标：解决 one-off async task 不应先构造临时 `Flow` 的问题。
+目标：降低提交、完成、等待、唤醒这些纯调度成本。
 
 优先 case：
 
@@ -124,178 +109,207 @@
 - `linear_chain`
 - `binary_tree`
 - `embarrassing_parallelism`
-- `graph_traversal`
+- `thread_pool`
+- 次级观察：`graph_traversal`
 
-涉及文件：
+主要文件：
 
 - `flow-core/src/executor.rs`
+- `flow-core/src/async_handle.rs`
 - `flow-core/src/async_task.rs`
 
-具体改动：
+优先改动：
 
-- 为 `Executor::async_task` 增加 direct enqueue 路径
-- 为 `Executor::silent_async` 增加 direct enqueue 路径
-- 让 dependent async 内部调度复用这条轻量路径
-- 保持现有的 `wait`、错误传播、panic 转换、取消语义不变
+- 降低 `RunHandle` 完成态查询和等待路径的锁成本
+- 降低 `active_runs` 计数与 `wait_for_all` 的同步成本
+- 降低 async task 提交后的唤醒和队列交互成本
+- 尽量让 runtime 内部提交优先落到当前 worker，减少跨线程同步
+- dependent async 继续复用最轻的提交路径
 
-建议实现约束：
+实现约束：
 
-- 不为 one-off async 创建临时 `Flow`
-- 不为 one-off async 创建完整 `RunState + GraphSnapshot`
-- 尽量复用现有 worker queue、notifier 和 `RunHandle`
+- 不能破坏现有 `wait`、错误传播、panic 转换、取消语义
+- 不能引入 run handle 提前完成
+- 不能牺牲当前 DAG 执行正确性来换 benchmark 数据
 
 验收标准：
 
 - `async_task` 明显改善
-- `linear_chain`、`binary_tree`、`embarrassing_parallelism` 的 ratio 同步下降
-- 相关测试覆盖 panic、wait、drop、依赖推进和取消行为
+- `linear_chain`、`binary_tree`、`embarrassing_parallelism` 同步下降
+- 相关单测覆盖 `wait`、panic、取消、依赖推进
 
-## 阶段 3：补运行时递归接口
+### P1：专项处理 `fibonacci`
 
-目标：让分治类 workload 不再通过“先构建整棵 DAG，再整体执行”的方式运行。
+目标：不是再加新递归接口，而是把现有 runtime recursion 路径做轻。
 
 优先 case：
 
 - `fibonacci`
-- `integrate`
-- 次级观察：`nqueens`、`skynet`
+- 次级观察：`nqueens`
 
-涉及文件：
+主要文件：
 
-- `flow-core/src/runtime.rs`
 - `flow-core/src/executor.rs`
+- `flow-core/src/runtime.rs`
+- `flow-core/src/async_handle.rs`
 - `benchmarks/src/bin/taskflow_compare.rs`
 
-具体改动：
+优先改动：
 
-- 设计一个轻量级 runtime recursion API，思路接近 `task_group + corun`
-- 允许 worker 在等待子任务时继续工作
-- 避免用高频 `Arc<Mutex<Option<T>>>` 作为递归结果合并主路径
+- 继续压低 `runtime_async` / `runtime_silent_async` 的提交成本
+- 减少递归等待路径上的 handle 对象和等待层级
+- 偏向 work-first，而不是每层都走完整通用句柄语义
+- 在不偏离 Taskflow benchmark 形状的前提下，保留深层顺序回退能力
 
 验收标准：
 
-- `fibonacci` 和 `integrate` 的 ratio 从数量级落后降到同一数量级内竞争
-- 不引入 worker 饥饿、死锁或 run handle 提前完成问题
+- `fibonacci` 明显下降
+- 不引入 worker 饥饿、死锁或递归等待卡死
 
-风险：
+### P2：瘦身算法层基础设施
 
-- 这是运行时语义级改动，回归面明显大于阶段 1 和阶段 2
-- 需要补足递归调度的单元测试和 benchmark 级验证
-
-## 阶段 4：瘦身算法层基础设施
-
-目标：减少 `parallel_transform`、`scan`、`sort` 等算法实现中的额外分配和拆分成本。
+目标：减少 `parallel_transform`、`scan`、`sort`、轻量算法 case 中的额外分配和拼接成本。
 
 优先 case：
 
-- `for_each`
-- `black_scholes`
 - `scan`
 - `sort`
+- `primes`
 - `reduce_sum` 小规模点
+- 次级观察：`for_each`、`black_scholes`
 
-涉及文件：
+主要文件：
 
 - `flow-algorithms/src/reduce_transform.rs`
-- `flow-algorithms/src/parallel_for.rs`
 - `flow-algorithms/src/find_scan_sort.rs`
+- `flow-algorithms/src/parallel_for.rs`
 
-具体改动：
+优先改动：
 
 - 增加 `parallel_transform_into`，直接写入预分配输出
-- 去掉每个输出元素一个 `Mutex<Option<T>>` 的路径
-- `Auto` chunk 计算基于 `executor.num_workers()`，不是宿主机总并发度
-- 给 `parallel_sort` 增加小规模 cutoff，减少过度任务拆分和 merge 轮次
-- 对 `scan` 先做 profile，再决定是 chunk prefix 路径还是 `async_task` 开销主导
+- 去掉“每个输出元素一个 `Mutex<Option<T>>`”的路径
+- 去掉 `parallel_transform` / `parallel_reduce` 中 run 后额外自旋等待的路径
+- 让 `Auto` chunk 策略和 executor worker 数保持一致
+- 给 `parallel_sort` 增加小规模 cutoff，减少过度拆分和 merge 轮次
+- 让 `scan` 优先走预分配写回，而不是 chunk 结果 `Vec` 再 flatten
 
 验收标准：
 
-- `for_each`、`black_scholes` 进一步改善
-- `scan` 和 `sort` 的小规模点明显下降
-- `mandelbrot` 和 `matrix_multiplication` 不出现回退
+- `scan` 和 `sort` 的倍数明显下降
+- `primes` 和 `reduce_sum` 小规模点同步改善
+- `mandelbrot`、`matrix_multiplication` 不出现回退
 
-## 阶段 5：优化 pipeline
+### P3：优化 pipeline
 
-目标：处理 pipeline 的真实结构性成本，而不是把所有性能问题都归因到 executor。
+目标：处理 pipeline 的真实结构性成本。
 
 优先 case：
 
 - `data_pipeline`
 - `graph_pipeline`
-- 次级观察：`linear_pipeline`
+- 次级观察：`linear_pipeline`、`wavefront`
 
-涉及文件：
+主要文件：
 
 - `flow-core/src/pipeline.rs`
 
-具体改动：
+优先改动：
 
 - 去掉 `Pipeline::run` / `DataPipeline::run` 的额外协调线程
 - 优先保留静态 typed pipeline 路径
-- 尽量绕开 `Box<dyn Any + Send>` 的 payload 热路径
-- 降低 serial stage 的锁与 bookkeeping 成本
+- 降低 serial stage 的锁和 bookkeeping 成本
+- 在必要时再处理 `Box<dyn Any + Send>` 的 payload 热路径
+
+实现约束：
+
+- `linear_pipeline` 的 steady-state 不退化
+- API 变动要谨慎，优先先做内部降重
 
 验收标准：
 
 - `data_pipeline` 明显改善
 - `graph_pipeline` 明显改善
-- `linear_pipeline` 的 steady-state 不退化
+- `linear_pipeline` 不回退
 
-风险：
+## 推荐推进顺序
 
-- pipeline 改动有 API 和实现双重影响
-- 如果过早大改，容易和前面的 runtime 改动混在一起，导致收益归因不清
+如果按单人连续推进，建议采用下面的顺序：
+
+1. 先做 P0，把 executor tiny-task 成本再压一轮
+2. 再做 P1，把 `fibonacci` 从现有 runtime recursion 路径继续做轻
+3. 然后做 P2，优先拿下 `scan` / `sort`
+4. 最后做 P3，处理 pipeline 的结构性成本
+
+原因：
+
+- P0 会同时影响多项 benchmark，回报最高
+- `fibonacci` 当前仍是最醒目的红项之一，值得单独看
+- `scan` / `sort` / `primes` 的问题不会靠 scheduler 优化自动消失
+- pipeline 改动面更广，放后面更容易归因
 
 ## 复测和汇报节奏
 
 建议固定如下节奏：
 
-1. 每完成一个阶段，先跑最小复测集
+1. 每完成一条主线中的一个子阶段，先跑最小复测集
 2. 如果收益符合预期，再跑全量报告
-3. 每个阶段都产出一段简短结论：
-   - 哪些 case 改善了
-   - 哪些 case 没改善
+3. 每次优化后都记录三件事：
+   - 哪些 case 变快了
+   - 哪些 case 没变
    - 是否有回退
-4. 全量报告更新后，再决定下一阶段是否需要调整优先级
+4. 每一轮报告都保留旧基线和新结果的可比描述
 
-## 推荐排期
+当前建议的最小复测集：
 
-如果只安排一个工程师连续推进，可以按下面的节奏：
+- `async_task`
+- `linear_chain`
+- `binary_tree`
+- `fibonacci`
+- `scan`
+- `sort`
+- `data_pipeline`
+- `graph_pipeline`
 
-- 第 1 周：阶段 1 + 阶段 2
-- 第 2 周：阶段 3
-- 第 3 周：阶段 4
-- 第 4 周：阶段 5 + 全量复测 + 报告更新
+如果本轮改动命中算法层，可额外补跑：
 
-如果阶段 2 收益已经足够显著，可以在第 2 周开始时重新评估阶段 3 和阶段 4 的先后顺序。
+- `primes`
+- `reduce_sum`
+- `for_each`
+- `black_scholes`
 
-## 跟踪清单
+## 当前跟踪清单
 
-- [ ] 冻结当前基线报告并确定最小复测集
-- [ ] 调整 `for_each` benchmark 结构
-- [ ] 调整 `black_scholes` benchmark 结构
-- [ ] 给 `Executor::async_task` 增加 fast path
-- [ ] 给 `Executor::silent_async` 增加 fast path
-- [ ] 让 dependent async 复用轻量调度路径
-- [ ] 设计并实现 runtime recursion API
-- [ ] 用 runtime recursion 重写 `fibonacci` benchmark 路径
-- [ ] 用 runtime recursion 重写 `integrate` benchmark 路径
-- [ ] 增加 `parallel_transform_into`
-- [ ] 调整 auto chunk 策略
-- [ ] 优化 `parallel_sort`
-- [ ] profile 并优化 `scan`
+### 已完成
+
+- [x] 调整 `for_each` benchmark 结构
+- [x] 调整 `black_scholes` benchmark 结构
+- [x] 给 `Executor::async_task` 增加 direct enqueue 路径
+- [x] 给 `Executor::silent_async` 增加 direct enqueue 路径
+- [x] 让 dependent async 复用轻量调度路径
+- [x] 设计并实现 runtime recursion 基础接口
+- [x] 用 runtime recursion 重写 `fibonacci` benchmark 路径
+- [x] 用 runtime recursion 重写 `integrate` benchmark 路径
+
+### 进行中
+
+- [ ] 继续压 executor tiny-task 固定成本
+- [ ] 降低 runtime recursion 等待路径的 handle 成本
+- [ ] 为 `parallel_transform` 增加预分配输出写回路径
+- [ ] 去掉算法层结果聚合中的多余锁和自旋等待
+- [ ] 优化 `parallel_sort` 的 cutoff 和 merge 策略
+- [ ] 重做 `scan` 的 chunk 输出路径
 - [ ] 去掉 pipeline 额外协调线程
-- [ ] 收紧 `DataPipeline` payload 热路径
+- [ ] 视复测结果决定是否继续收紧 `DataPipeline` payload 热路径
 - [ ] 阶段性复测并更新专项报告
 
 ## 成功标准
 
-这轮优化完成后，至少应达到以下结果：
+这轮继续优化后，至少应达到以下结果：
 
-- `async_task`、`linear_chain` 相比当前基线显著收敛
-- `for_each`、`black_scholes` 的对比具备可信 benchmark 等价性
-- `fibonacci`、`integrate` 不再出现数量级级别的巨大差距
+- `async_task`、`linear_chain`、`binary_tree` 相比当前基线继续收敛
+- `fibonacci` 不再长期停留在最醒目的数量级红区
+- `scan`、`sort` 的倍数明显下降
 - `data_pipeline`、`graph_pipeline` 的 ratio 明显下降
-- 现有优势项如 `mandelbrot`、`matrix_multiplication` 不回退
+- 已有优势项如 `integrate`、`skynet`、`matrix_multiplication` 不回退
 
 如果这些标准达不到，就不应该急着继续扩展 API，而应该先回到 profiling 和实现细节层面复盘。

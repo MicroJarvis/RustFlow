@@ -49,6 +49,7 @@ impl RunHandle {
 struct RunHandleState {
     result: Mutex<Option<Result<(), FlowError>>>,
     ready: Condvar,
+    finished: AtomicBool,
     cancelled: Arc<AtomicBool>,
 }
 
@@ -57,6 +58,7 @@ impl Default for RunHandleState {
         Self {
             result: Mutex::new(None),
             ready: Condvar::new(),
+            finished: AtomicBool::new(false),
             cancelled: Arc::new(AtomicBool::new(false)),
         }
     }
@@ -67,11 +69,20 @@ impl RunHandleState {
         let mut slot = self.result.lock().expect("run handle state poisoned");
         if slot.is_none() {
             *slot = Some(result);
+            self.finished.store(true, Ordering::Release);
             self.ready.notify_all();
         }
     }
 
     fn wait(&self) -> Result<(), FlowError> {
+        if self.finished.load(Ordering::Acquire) {
+            return self.result
+                .lock()
+                .expect("run handle state poisoned")
+                .clone()
+                .expect("run handle result must be available after completion");
+        }
+
         let mut slot = self.result.lock().expect("run handle state poisoned");
         while slot.is_none() {
             slot = self.ready.wait(slot).expect("run handle wait poisoned");
@@ -81,13 +92,14 @@ impl RunHandleState {
     }
 
     fn is_finished(&self) -> bool {
-        self.result
-            .lock()
-            .expect("run handle state poisoned")
-            .is_some()
+        self.finished.load(Ordering::Acquire)
     }
 
     fn cancel(&self) -> bool {
+        if self.finished.load(Ordering::Acquire) {
+            return false;
+        }
+
         let slot = self.result.lock().expect("run handle state poisoned");
         if slot.is_some() {
             return false;
@@ -117,8 +129,9 @@ impl Executor {
             notifier: Notifier::default(),
             worker_count,
             next_worker: AtomicUsize::new(0),
-            active_runs: Mutex::new(0),
+            active_runs: AtomicUsize::new(0),
             active_runs_ready: Condvar::new(),
+            active_runs_wait: Mutex::new(()),
             shutdown: AtomicBool::new(false),
             threads: Mutex::new(Vec::with_capacity(worker_count)),
             observers: RwLock::new(Vec::new()),
@@ -194,16 +207,16 @@ impl Executor {
     }
 
     pub fn wait_for_all(&self) {
-        let mut active_runs = self
+        let mut wait_guard = self
             .inner
-            .active_runs
+            .active_runs_wait
             .lock()
-            .expect("executor active runs poisoned");
-        while *active_runs > 0 {
-            active_runs = self
+            .expect("executor active runs wait poisoned");
+        while self.inner.active_runs.load(Ordering::Acquire) > 0 {
+            wait_guard = self
                 .inner
                 .active_runs_ready
-                .wait(active_runs)
+                .wait(wait_guard)
                 .expect("executor wait_for_all poisoned");
         }
     }
@@ -303,14 +316,14 @@ impl Executor {
     ) -> Result<(), FlowError> {
         let mut known_epoch = self.inner.notifier.current_epoch();
 
-        while handles.iter().any(|handle| !handle.is_finished()) {
+        loop {
+            if handles.iter().all(RunHandle::is_finished) {
+                break;
+            }
+
             if let Some(task) = self.inner.next_task(worker_id) {
                 self.inner.execute(self, worker_id, task);
                 continue;
-            }
-
-            if handles.iter().all(RunHandle::is_finished) {
-                break;
             }
 
             self.inner
@@ -451,8 +464,9 @@ struct ExecutorInner {
     notifier: Notifier,
     worker_count: usize,
     next_worker: AtomicUsize,
-    active_runs: Mutex<usize>,
+    active_runs: AtomicUsize,
     active_runs_ready: Condvar,
+    active_runs_wait: Mutex<()>,
     shutdown: AtomicBool,
     threads: Mutex<Vec<JoinHandle<()>>>,
     observers: RwLock<Vec<Arc<dyn Observer>>>,
@@ -460,20 +474,17 @@ struct ExecutorInner {
 
 impl ExecutorInner {
     fn increment_active_runs(&self) {
-        let mut active_runs = self
-            .active_runs
-            .lock()
-            .expect("executor active runs poisoned");
-        *active_runs += 1;
+        self.active_runs.fetch_add(1, Ordering::AcqRel);
     }
 
     fn decrement_active_runs(&self) {
-        let mut active_runs = self
-            .active_runs
-            .lock()
-            .expect("executor active runs poisoned");
-        *active_runs = active_runs.saturating_sub(1);
-        if *active_runs == 0 {
+        let previous = self.active_runs.fetch_sub(1, Ordering::AcqRel);
+        debug_assert!(previous > 0, "executor active run count underflow");
+        if previous == 1 {
+            let _guard = self
+                .active_runs_wait
+                .lock()
+                .expect("executor active runs wait poisoned");
             self.active_runs_ready.notify_all();
         }
     }
