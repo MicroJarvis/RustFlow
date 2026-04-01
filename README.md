@@ -60,6 +60,7 @@ cargo run -p benchmarks -- \
 - `doc/development-plan.md`
 - `doc/epics.md`
 - `doc/stories.md`
+- `doc/taskflow-performance-plan.md`
 
 ## Suggested Next Focus
 
