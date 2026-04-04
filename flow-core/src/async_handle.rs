@@ -1,5 +1,6 @@
+use std::cell::UnsafeCell;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Condvar, Mutex};
+use std::sync::{Arc, Condvar, Mutex, OnceLock};
 
 use crate::error::FlowError;
 use crate::executor::RunHandle;
@@ -88,16 +89,25 @@ impl<T> AsyncState<T> {
 }
 
 pub(crate) struct RuntimeAsyncState<T> {
-    outcome: Mutex<Option<Result<T, FlowError>>>,
-    ready: Condvar,
+    outcome: UnsafeCell<Option<Result<T, FlowError>>>,
+    waiter: OnceLock<Box<RuntimeAsyncWaiter>>,
     finished: AtomicBool,
+}
+
+unsafe impl<T: Send> Send for RuntimeAsyncState<T> {}
+unsafe impl<T: Send> Sync for RuntimeAsyncState<T> {}
+
+#[derive(Default)]
+struct RuntimeAsyncWaiter {
+    lock: Mutex<()>,
+    ready: Condvar,
 }
 
 impl<T> RuntimeAsyncState<T> {
     pub(crate) fn new() -> Self {
         Self {
-            outcome: Mutex::new(None),
-            ready: Condvar::new(),
+            outcome: UnsafeCell::new(None),
+            waiter: OnceLock::new(),
             finished: AtomicBool::new(false),
         }
     }
@@ -119,31 +129,49 @@ impl<T> RuntimeAsyncState<T> {
             return self.take_outcome();
         }
 
-        let mut slot = self.outcome.lock().expect("runtime async state poisoned");
-        while slot.is_none() {
-            slot = self
+        let waiter = self
+            .waiter
+            .get_or_init(|| Box::new(RuntimeAsyncWaiter::default()));
+        let mut guard = waiter.lock.lock().expect("runtime async wait poisoned");
+        while !self.finished.load(Ordering::Acquire) {
+            guard = waiter
                 .ready
-                .wait(slot)
+                .wait(guard)
                 .expect("runtime async state wait poisoned");
         }
-        slot.take()
-            .expect("runtime async outcome must be available after wait")
+        drop(guard);
+        self.take_outcome()
     }
 
     fn complete(&self, outcome: Result<T, FlowError>) {
-        let mut slot = self.outcome.lock().expect("runtime async state poisoned");
-        if slot.is_none() {
-            *slot = Some(outcome);
+        if let Some(waiter) = self.waiter.get() {
+            let _guard = waiter.lock.lock().expect("runtime async wait poisoned");
+            debug_assert!(
+                !self.finished.load(Ordering::Relaxed),
+                "runtime async state completed more than once"
+            );
+            unsafe {
+                *self.outcome.get() = Some(outcome);
+            }
             self.finished.store(true, Ordering::Release);
-            self.ready.notify_all();
+            waiter.ready.notify_all();
+        } else {
+            debug_assert!(
+                !self.finished.load(Ordering::Relaxed),
+                "runtime async state completed more than once"
+            );
+            unsafe {
+                *self.outcome.get() = Some(outcome);
+            }
+            self.finished.store(true, Ordering::Release);
         }
     }
 
     fn take_outcome(&self) -> Result<T, FlowError> {
-        self.outcome
-            .lock()
-            .expect("runtime async state poisoned")
-            .take()
-            .expect("runtime async outcome must be available after completion")
+        unsafe {
+            (*self.outcome.get())
+                .take()
+                .expect("runtime async outcome must be available after completion")
+        }
     }
 }

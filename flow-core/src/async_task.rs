@@ -78,12 +78,13 @@ impl AsyncTaskState {
 
     fn schedule(self: &Arc<Self>) {
         let state = Arc::clone(self);
-        let _ = self
-            .executor
-            .schedule_async_runner(Box::new(move |_| {
+        let _ = self.executor.schedule_async_runner(
+            Box::new(move |_| {
                 state.run();
                 Ok(())
-            }), None);
+            }),
+            None,
+        );
     }
 
     fn run(self: Arc<Self>) {

@@ -241,7 +241,6 @@ pub(crate) struct NodeSnapshot {
     pub(crate) name: Option<String>,
     pub(crate) kind: TaskKind,
     pub(crate) successors: Vec<usize>,
-    pub(crate) total_predecessor_count: usize,
     pub(crate) predecessor_count: usize,
     pub(crate) to_acquire: Vec<Semaphore>,
     pub(crate) to_release: Vec<Semaphore>,
@@ -250,6 +249,7 @@ pub(crate) struct NodeSnapshot {
 #[derive(Clone)]
 pub(crate) struct GraphSnapshot {
     pub(crate) nodes: Vec<NodeSnapshot>,
+    pub(crate) roots: Vec<usize>,
 }
 
 struct Node {
@@ -298,7 +298,6 @@ fn snapshot_graph(graph: &Graph) -> GraphSnapshot {
             name: node.name.clone(),
             kind: node.kind.clone(),
             successors: node.successors.iter().map(|task_id| task_id.0).collect(),
-            total_predecessor_count: node.predecessors.len(),
             predecessor_count: node
                 .predecessors
                 .iter()
@@ -309,7 +308,14 @@ fn snapshot_graph(graph: &Graph) -> GraphSnapshot {
         })
         .collect();
 
-    GraphSnapshot { nodes }
+    let roots = graph
+        .nodes
+        .iter()
+        .enumerate()
+        .filter_map(|(index, node)| node.predecessors.is_empty().then_some(index))
+        .collect();
+
+    GraphSnapshot { nodes, roots }
 }
 
 struct FlowInner {

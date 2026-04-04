@@ -2,15 +2,15 @@ use std::any::Any;
 use std::cell::RefCell;
 use std::collections::VecDeque;
 use std::panic::{self, AssertUnwindSafe};
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::{Arc, Condvar, Mutex, RwLock};
+use std::sync::atomic::{fence, AtomicBool, AtomicU32, AtomicU8, AtomicUsize, Ordering};
+use std::sync::{Arc, Condvar, Mutex, OnceLock, RwLock};
 use std::thread::{self, JoinHandle};
 
 use crate::async_handle::{AsyncHandle, AsyncState, RuntimeAsyncState};
 use crate::error::FlowError;
 use crate::flow::{Flow, GraphSnapshot, NodeSnapshot, Subflow, TaskId, TaskKind};
 use crate::observer::Observer;
-use crate::runtime::RuntimeCtx;
+use crate::runtime::{RuntimeCtx, RuntimeJoinScope};
 
 const WORKER_STACK_SIZE: usize = 16 * 1024 * 1024;
 
@@ -19,6 +19,7 @@ struct RuntimeSpawnContext {
     executor: Arc<ExecutorInner>,
     worker_id: usize,
     cancelled: Arc<AtomicBool>,
+    join_scope: Arc<RuntimeJoinScope>,
 }
 
 thread_local! {
@@ -40,6 +41,12 @@ impl Drop for RuntimeSpawnContextGuard {
 fn install_runtime_spawn_context(context: RuntimeSpawnContext) -> RuntimeSpawnContextGuard {
     let previous = CURRENT_RUNTIME_SPAWN_CONTEXT.with(|slot| slot.replace(Some(context)));
     RuntimeSpawnContextGuard { previous }
+}
+
+#[derive(Clone, Copy)]
+enum DriveMode {
+    AllowPark,
+    NoPark,
 }
 
 #[derive(Clone)]
@@ -76,8 +83,8 @@ impl RunHandle {
 }
 
 struct RunHandleState {
-    result: Mutex<Option<Result<(), FlowError>>>,
-    ready: Condvar,
+    result: OnceLock<Result<(), FlowError>>,
+    waiter: OnceLock<Box<RunHandleWaiter>>,
     finished: AtomicBool,
     cancelled: Arc<AtomicBool>,
 }
@@ -85,21 +92,30 @@ struct RunHandleState {
 impl Default for RunHandleState {
     fn default() -> Self {
         Self {
-            result: Mutex::new(None),
-            ready: Condvar::new(),
+            result: OnceLock::new(),
+            waiter: OnceLock::new(),
             finished: AtomicBool::new(false),
             cancelled: Arc::new(AtomicBool::new(false)),
         }
     }
 }
 
+#[derive(Default)]
+struct RunHandleWaiter {
+    lock: Mutex<()>,
+    ready: Condvar,
+}
+
 impl RunHandleState {
     fn complete(&self, result: Result<(), FlowError>) {
-        let mut slot = self.result.lock().expect("run handle state poisoned");
-        if slot.is_none() {
-            *slot = Some(result);
+        if let Some(waiter) = self.waiter.get() {
+            let _guard = waiter.lock.lock().expect("run handle wait poisoned");
+            if self.result.set(result).is_ok() {
+                self.finished.store(true, Ordering::Release);
+                waiter.ready.notify_all();
+            }
+        } else if self.result.set(result).is_ok() {
             self.finished.store(true, Ordering::Release);
-            self.ready.notify_all();
         }
     }
 
@@ -107,18 +123,23 @@ impl RunHandleState {
         if self.finished.load(Ordering::Acquire) {
             return self
                 .result
-                .lock()
-                .expect("run handle state poisoned")
-                .clone()
-                .expect("run handle result must be available after completion");
+                .get()
+                .expect("run handle result must be available after completion")
+                .clone();
         }
 
-        let mut slot = self.result.lock().expect("run handle state poisoned");
-        while slot.is_none() {
-            slot = self.ready.wait(slot).expect("run handle wait poisoned");
+        let waiter = self
+            .waiter
+            .get_or_init(|| Box::new(RunHandleWaiter::default()));
+        let mut guard = waiter.lock.lock().expect("run handle wait poisoned");
+        while !self.finished.load(Ordering::Acquire) {
+            guard = waiter.ready.wait(guard).expect("run handle wait poisoned");
         }
-        slot.clone()
+        drop(guard);
+        self.result
+            .get()
             .expect("run handle result must be available after wait")
+            .clone()
     }
 
     fn is_finished(&self) -> bool {
@@ -130,11 +151,9 @@ impl RunHandleState {
             return false;
         }
 
-        let slot = self.result.lock().expect("run handle state poisoned");
-        if slot.is_some() {
+        if self.result.get().is_some() {
             return false;
         }
-        drop(slot);
 
         self.cancelled.store(true, Ordering::Release);
         true
@@ -153,15 +172,17 @@ impl Executor {
         let workers = (0..worker_count)
             .map(|_| Arc::new(WorkerQueue::default()))
             .collect();
+        let parkers = (0..worker_count)
+            .map(|_| Arc::new(WorkerParker::default()))
+            .collect();
 
         let inner = Arc::new(ExecutorInner {
             workers,
-            notifier: Notifier::default(),
+            parkers,
+            run_completion: RunCompletionEvent::default(),
             worker_count,
             next_worker: AtomicUsize::new(0),
             active_runs: AtomicUsize::new(0),
-            active_runs_ready: Condvar::new(),
-            active_runs_wait: Mutex::new(()),
             shutdown: AtomicBool::new(false),
             threads: Mutex::new(Vec::with_capacity(worker_count)),
             observers: RwLock::new(Vec::new()),
@@ -237,17 +258,11 @@ impl Executor {
     }
 
     pub fn wait_for_all(&self) {
-        let mut wait_guard = self
-            .inner
-            .active_runs_wait
-            .lock()
-            .expect("executor active runs wait poisoned");
+        let mut known_epoch = self.inner.run_completion.current_epoch();
         while self.inner.active_runs.load(Ordering::Acquire) > 0 {
-            wait_guard = self
-                .inner
-                .active_runs_ready
-                .wait(wait_guard)
-                .expect("executor wait_for_all poisoned");
+            self.inner
+                .run_completion
+                .wait(&mut known_epoch, &self.inner.shutdown);
         }
     }
 
@@ -344,7 +359,12 @@ impl Executor {
                 Ok(())
             }),
             context.as_ref().map(|context| context.worker_id),
-            context.map(|context| context.cancelled),
+            context
+                .as_ref()
+                .map(|context| Arc::clone(&context.cancelled)),
+            context
+                .as_ref()
+                .map(|context| Arc::clone(&context.join_scope)),
         )
     }
 
@@ -379,26 +399,14 @@ impl Executor {
     where
         F: FnMut() -> bool,
     {
-        let mut known_epoch = self.inner.notifier.current_epoch();
-        let mut continuation = None;
+        self.drive_worker_until(worker_id, DriveMode::NoPark, &mut done);
+    }
 
-        loop {
-            if done() {
-                return;
-            }
-
-            let task = continuation
-                .take()
-                .or_else(|| self.inner.next_task(worker_id));
-            if let Some(task) = task {
-                continuation = self.inner.execute(self, worker_id, task);
-                continue;
-            }
-
-            self.inner
-                .notifier
-                .wait(&mut known_epoch, &self.inner.shutdown);
-        }
+    pub(crate) fn schedule_runtime_runner(
+        &self,
+        runner: Box<dyn FnOnce(&RuntimeCtx) -> Result<(), FlowError> + Send + 'static>,
+    ) -> RunHandle {
+        self.schedule_async_runner(runner, None)
     }
 
     fn start_run(&self, snapshot: Arc<GraphSnapshot>, worker_hint: Option<usize>) -> RunHandle {
@@ -423,15 +431,15 @@ impl Executor {
         run.outstanding
             .fetch_add(root_indices.len(), Ordering::AcqRel);
 
-        for task_index in root_indices {
-            self.inner.schedule_precounted(
-                ScheduledTask {
-                    run: Arc::clone(&run),
-                    task_index,
-                },
-                worker_hint,
-            );
-        }
+        let scheduled_roots = root_indices
+            .into_iter()
+            .map(|task_index| ScheduledTask {
+                run: Arc::clone(&run),
+                task_index,
+            })
+            .collect();
+        self.inner
+            .schedule_precounted_batch(scheduled_roots, worker_hint);
 
         handle
     }
@@ -441,7 +449,22 @@ impl Executor {
         runner: Box<dyn FnOnce(&RuntimeCtx) -> Result<(), FlowError> + Send + 'static>,
         worker_hint: Option<usize>,
     ) -> RunHandle {
-        self.schedule_async_runner_with_runtime_cancelled(runner, worker_hint, None)
+        self.schedule_async_runner_with_runtime_cancelled(runner, worker_hint, None, None)
+    }
+
+    pub(crate) fn schedule_runtime_silent_child(
+        &self,
+        runner: Box<dyn FnOnce(&RuntimeCtx) -> Result<(), FlowError> + Send + 'static>,
+        worker_hint: usize,
+        runtime_cancelled: Arc<AtomicBool>,
+        join_scope: Arc<RuntimeJoinScope>,
+    ) {
+        join_scope.add_child();
+        self.inner.increment_active_runs();
+        self.inner.enqueue_async(
+            ScheduledAsyncTask::runtime_child(runner, runtime_cancelled, join_scope),
+            Some(worker_hint),
+        );
     }
 
     fn current_runtime_spawn_context(&self) -> Option<RuntimeSpawnContext> {
@@ -456,15 +479,62 @@ impl Executor {
         runner: Box<dyn FnOnce(&RuntimeCtx) -> Result<(), FlowError> + Send + 'static>,
         worker_hint: Option<usize>,
         runtime_cancelled: Option<Arc<AtomicBool>>,
+        join_scope: Option<Arc<RuntimeJoinScope>>,
     ) -> RunHandle {
         let handle = RunHandle::pending();
         self.inner.increment_active_runs();
         let runtime_cancelled = runtime_cancelled.unwrap_or_else(|| handle.cancelled_flag());
+        if let Some(join_scope) = &join_scope {
+            join_scope.add_child();
+        }
         self.inner.enqueue_async(
-            ScheduledAsyncTask::run_handle(runner, handle.clone(), runtime_cancelled),
+            ScheduledAsyncTask::run_handle(runner, handle.clone(), runtime_cancelled, join_scope),
             worker_hint,
         );
         handle
+    }
+
+    fn drive_worker_until<F>(&self, worker_id: usize, mode: DriveMode, done: &mut F)
+    where
+        F: FnMut() -> bool,
+    {
+        let mut continuation = None;
+
+        loop {
+            if done() {
+                return;
+            }
+
+            let task = continuation
+                .take()
+                .or_else(|| self.inner.next_task(worker_id));
+            if let Some(task) = task {
+                continuation = self.inner.execute(self, worker_id, task);
+                continue;
+            }
+
+            match mode {
+                DriveMode::AllowPark => {
+                    let observed_epoch = self.inner.prepare_park(worker_id);
+
+                    if done() {
+                        self.inner.cancel_park(worker_id, observed_epoch);
+                        return;
+                    }
+
+                    let task = self.inner.next_task(worker_id);
+                    if let Some(task) = task {
+                        self.inner.cancel_park(worker_id, observed_epoch);
+                        continuation = self.inner.execute(self, worker_id, task);
+                        continue;
+                    }
+
+                    self.inner
+                        .commit_park(worker_id, observed_epoch, &self.inner.shutdown);
+                }
+                DriveMode::NoPark => thread::yield_now(),
+            }
+        }
     }
 }
 
@@ -475,7 +545,8 @@ impl Drop for Executor {
         }
 
         self.inner.shutdown.store(true, Ordering::SeqCst);
-        self.inner.notifier.notify_all();
+        self.inner.wake_all_workers();
+        self.inner.run_completion.notify_all();
 
         let mut threads = self
             .inner
@@ -494,11 +565,18 @@ struct WorkerQueue {
 }
 
 impl WorkerQueue {
-    fn push_back(&self, task: ScheduledWork) {
-        self.tasks
-            .lock()
-            .expect("worker queue poisoned")
-            .push_back(task);
+    fn push_back(&self, task: ScheduledWork) -> bool {
+        let mut tasks = self.tasks.lock().expect("worker queue poisoned");
+        let was_empty = tasks.is_empty();
+        tasks.push_back(task);
+        was_empty
+    }
+
+    fn push_back_many(&self, tasks_to_push: Vec<ScheduledWork>) -> bool {
+        let mut tasks = self.tasks.lock().expect("worker queue poisoned");
+        let was_empty = tasks.is_empty();
+        tasks.extend(tasks_to_push);
+        was_empty
     }
 
     fn pop_back(&self) -> Option<ScheduledWork> {
@@ -514,26 +592,36 @@ impl WorkerQueue {
 }
 
 #[derive(Default)]
-struct Notifier {
+struct WorkerParker {
+    state: AtomicU8,
+    epoch: AtomicU32,
+    thread: OnceLock<thread::Thread>,
+}
+
+#[derive(Default)]
+struct RunCompletionEvent {
     epoch: Mutex<u64>,
     ready: Condvar,
 }
 
-impl Notifier {
+impl RunCompletionEvent {
     fn current_epoch(&self) -> u64 {
-        *self.epoch.lock().expect("notifier poisoned")
+        *self.epoch.lock().expect("run completion poisoned")
     }
 
     fn notify_all(&self) {
-        let mut epoch = self.epoch.lock().expect("notifier poisoned");
+        let mut epoch = self.epoch.lock().expect("run completion poisoned");
         *epoch += 1;
         self.ready.notify_all();
     }
 
     fn wait(&self, known_epoch: &mut u64, shutdown: &AtomicBool) {
-        let mut epoch = self.epoch.lock().expect("notifier poisoned");
+        let mut epoch = self.epoch.lock().expect("run completion poisoned");
         while *epoch == *known_epoch && !shutdown.load(Ordering::Acquire) {
-            epoch = self.ready.wait(epoch).expect("notifier wait poisoned");
+            epoch = self
+                .ready
+                .wait(epoch)
+                .expect("run completion wait poisoned");
         }
         *known_epoch = *epoch;
     }
@@ -541,18 +629,25 @@ impl Notifier {
 
 struct ExecutorInner {
     workers: Vec<Arc<WorkerQueue>>,
-    notifier: Notifier,
+    parkers: Vec<Arc<WorkerParker>>,
+    run_completion: RunCompletionEvent,
     worker_count: usize,
     next_worker: AtomicUsize,
     active_runs: AtomicUsize,
-    active_runs_ready: Condvar,
-    active_runs_wait: Mutex<()>,
     shutdown: AtomicBool,
     threads: Mutex<Vec<JoinHandle<()>>>,
     observers: RwLock<Vec<Arc<dyn Observer>>>,
 }
 
+const WORKER_RUNNING: u8 = 0;
+const WORKER_PREPARING: u8 = 1;
+const WORKER_PARKED: u8 = 2;
+
 impl ExecutorInner {
+    fn register_worker_thread(&self, worker_id: usize) {
+        let _ = self.parkers[worker_id].thread.set(thread::current());
+    }
+
     fn increment_active_runs(&self) {
         self.active_runs.fetch_add(1, Ordering::AcqRel);
     }
@@ -561,11 +656,7 @@ impl ExecutorInner {
         let previous = self.active_runs.fetch_sub(1, Ordering::AcqRel);
         debug_assert!(previous > 0, "executor active run count underflow");
         if previous == 1 {
-            let _guard = self
-                .active_runs_wait
-                .lock()
-                .expect("executor active runs wait poisoned");
-            self.active_runs_ready.notify_all();
+            self.run_completion.notify_all();
         }
     }
 
@@ -597,13 +688,80 @@ impl ExecutorInner {
         }
     }
 
+    fn prepare_park(&self, worker_id: usize) -> u64 {
+        let parker = &self.parkers[worker_id];
+        parker.state.store(WORKER_PREPARING, Ordering::Relaxed);
+        let epoch = parker.epoch.load(Ordering::Relaxed);
+        fence(Ordering::SeqCst);
+        u64::from(epoch)
+    }
+
+    fn cancel_park(&self, worker_id: usize, _observed_epoch: u64) {
+        self.parkers[worker_id]
+            .state
+            .store(WORKER_RUNNING, Ordering::Relaxed);
+    }
+
+    fn commit_park(&self, worker_id: usize, observed_epoch: u64, shutdown: &AtomicBool) {
+        let parker = &self.parkers[worker_id];
+        let observed_epoch = observed_epoch as u32;
+
+        if parker.state.load(Ordering::Relaxed) != WORKER_PREPARING
+            || parker.epoch.load(Ordering::Relaxed) != observed_epoch
+            || shutdown.load(Ordering::Acquire)
+        {
+            parker.state.store(WORKER_RUNNING, Ordering::Relaxed);
+            return;
+        }
+
+        parker.state.store(WORKER_PARKED, Ordering::Release);
+        self.notify_worker_sleep(worker_id);
+
+        while parker.epoch.load(Ordering::Relaxed) == observed_epoch
+            && !shutdown.load(Ordering::Acquire)
+        {
+            thread::park();
+        }
+
+        parker.state.store(WORKER_RUNNING, Ordering::Relaxed);
+        if parker.epoch.load(Ordering::Relaxed) != observed_epoch
+            && !shutdown.load(Ordering::Acquire)
+        {
+            self.notify_worker_wake(worker_id);
+        }
+    }
+
+    fn wake_worker(&self, worker_id: usize) -> bool {
+        let parker = &self.parkers[worker_id];
+        let state = parker.state.load(Ordering::Acquire);
+        if state != WORKER_PREPARING && state != WORKER_PARKED {
+            return false;
+        }
+
+        parker.epoch.fetch_add(1, Ordering::Release);
+        if let Some(thread) = parker.thread.get() {
+            thread.unpark();
+        }
+        true
+    }
+
+    fn wake_all_workers(&self) {
+        fence(Ordering::SeqCst);
+        for worker_id in 0..self.parkers.len() {
+            let _ = self.wake_worker(worker_id);
+        }
+    }
+
     fn schedule(&self, task: ScheduledTask, worker_hint: Option<usize>) {
         task.run.outstanding.fetch_add(1, Ordering::AcqRel);
         self.enqueue_graph(task, worker_hint);
     }
 
-    fn schedule_precounted(&self, task: ScheduledTask, worker_hint: Option<usize>) {
-        self.enqueue_graph(task, worker_hint);
+    fn schedule_precounted_batch(&self, tasks: Vec<ScheduledTask>, worker_hint: Option<usize>) {
+        self.enqueue_many(
+            tasks.into_iter().map(ScheduledWork::Graph).collect(),
+            worker_hint,
+        );
     }
 
     fn schedule_ready_graph(
@@ -632,23 +790,79 @@ impl ExecutorInner {
         let worker_id = worker_hint.unwrap_or_else(|| {
             self.next_worker.fetch_add(1, Ordering::Relaxed) % self.worker_count
         });
-        self.workers[worker_id].push_back(task);
-        self.notifier.notify_all();
+        let queue_was_empty = self.workers[worker_id].push_back(task);
+        if !queue_was_empty {
+            return;
+        }
+        fence(Ordering::SeqCst);
+        if !self.wake_worker(worker_id) {
+            for parked_worker in 0..self.parkers.len() {
+                if parked_worker != worker_id && self.wake_worker(parked_worker) {
+                    break;
+                }
+            }
+        }
+    }
+
+    fn enqueue_many(&self, tasks: Vec<ScheduledWork>, worker_hint: Option<usize>) {
+        if tasks.is_empty() {
+            return;
+        }
+
+        if let Some(worker_id) = worker_hint {
+            let queue_was_empty = self.workers[worker_id].push_back_many(tasks);
+            if !queue_was_empty {
+                return;
+            }
+            fence(Ordering::SeqCst);
+            if !self.wake_worker(worker_id) {
+                for parked_worker in 0..self.parkers.len() {
+                    if parked_worker != worker_id && self.wake_worker(parked_worker) {
+                        break;
+                    }
+                }
+            }
+            return;
+        }
+
+        let start_worker = self.next_worker.fetch_add(tasks.len(), Ordering::Relaxed);
+        let mut per_worker = (0..self.worker_count)
+            .map(|_| Vec::new())
+            .collect::<Vec<Vec<ScheduledWork>>>();
+
+        for (offset, task) in tasks.into_iter().enumerate() {
+            let worker_id = (start_worker + offset) % self.worker_count;
+            per_worker[worker_id].push(task);
+        }
+
+        let mut activated_workers = Vec::new();
+        for (worker_id, bucket) in per_worker.into_iter().enumerate() {
+            if bucket.is_empty() {
+                continue;
+            }
+            if self.workers[worker_id].push_back_many(bucket) {
+                activated_workers.push(worker_id);
+            }
+        }
+
+        if activated_workers.is_empty() {
+            return;
+        }
+
+        fence(Ordering::SeqCst);
+        for worker_id in activated_workers {
+            let _ = self.wake_worker(worker_id);
+        }
     }
 
     fn reschedule_waiters(&self, waiters: Vec<ScheduledTask>, worker_hint: Option<usize>) {
         if waiters.is_empty() {
             return;
         }
-
-        for waiter in waiters {
-            let worker_id = worker_hint.unwrap_or_else(|| {
-                self.next_worker.fetch_add(1, Ordering::Relaxed) % self.worker_count
-            });
-            self.workers[worker_id].push_back(ScheduledWork::Graph(waiter));
-        }
-
-        self.notifier.notify_all();
+        self.enqueue_many(
+            waiters.into_iter().map(ScheduledWork::Graph).collect(),
+            worker_hint,
+        );
     }
 
     fn next_task(&self, worker_id: usize) -> Option<ScheduledWork> {
@@ -777,6 +991,7 @@ impl ExecutorInner {
         worker_id: usize,
         mut scheduled: ScheduledAsyncTask,
     ) {
+        let join_scope = scheduled.runtime_join_scope.take();
         if scheduled
             .skip_if_cancelled
             .as_ref()
@@ -785,8 +1000,10 @@ impl ExecutorInner {
             if let Some(on_success) = scheduled.on_success.take() {
                 on_success();
             }
+            if let Some(join_scope) = join_scope {
+                join_scope.finish_child(Ok(()));
+            }
             self.decrement_active_runs();
-            self.notifier.notify_all();
             return;
         }
 
@@ -794,20 +1011,28 @@ impl ExecutorInner {
             .runner
             .take()
             .expect("async runner scheduled more than once");
+        let runtime_join_scope = Arc::new(RuntimeJoinScope::default());
         let runtime = RuntimeCtx::new(
             executor.clone(),
             worker_id,
             None,
             Arc::clone(&scheduled.runtime_cancelled),
+            Arc::clone(&runtime_join_scope),
         );
         let _runtime_context = install_runtime_spawn_context(RuntimeSpawnContext {
             executor: Arc::clone(&executor.inner),
             worker_id,
             cancelled: Arc::clone(&scheduled.runtime_cancelled),
+            join_scope: runtime_join_scope,
         });
         let result = match panic::catch_unwind(AssertUnwindSafe(|| runner(&runtime))) {
             Ok(result) => result,
             Err(payload) => Err(FlowError::plain(panic_payload_to_string(payload))),
+        };
+
+        let completion_result = match &result {
+            Ok(()) => Ok(()),
+            Err(error) => Err(error.clone()),
         };
 
         match result {
@@ -818,12 +1043,14 @@ impl ExecutorInner {
             }
             Err(error) => {
                 if let Some(on_error) = scheduled.on_error.take() {
-                    on_error(error);
+                    on_error(error.clone());
                 }
             }
         }
+        if let Some(join_scope) = join_scope {
+            join_scope.finish_child(completion_result);
+        }
         self.decrement_active_runs();
-        self.notifier.notify_all();
     }
 
     fn finish_task(&self, scheduled: &ScheduledTask) {
@@ -835,7 +1062,6 @@ impl ExecutorInner {
             let result = scheduled.run.final_result();
             scheduled.run.handle.complete(result);
             self.decrement_active_runs();
-            self.notifier.notify_all();
         }
     }
 
@@ -887,6 +1113,7 @@ enum ScheduledWork {
 struct ScheduledAsyncTask {
     runner: Option<Box<dyn FnOnce(&RuntimeCtx) -> Result<(), FlowError> + Send + 'static>>,
     runtime_cancelled: Arc<AtomicBool>,
+    runtime_join_scope: Option<Arc<RuntimeJoinScope>>,
     skip_if_cancelled: Option<Arc<AtomicBool>>,
     on_success: Option<Box<dyn FnOnce() + Send + 'static>>,
     on_error: Option<Box<dyn FnOnce(FlowError) + Send + 'static>>,
@@ -897,16 +1124,33 @@ impl ScheduledAsyncTask {
         runner: Box<dyn FnOnce(&RuntimeCtx) -> Result<(), FlowError> + Send + 'static>,
         run_handle: RunHandle,
         runtime_cancelled: Arc<AtomicBool>,
+        runtime_join_scope: Option<Arc<RuntimeJoinScope>>,
     ) -> Self {
         Self {
             runner: Some(runner),
             runtime_cancelled,
+            runtime_join_scope,
             skip_if_cancelled: Some(run_handle.cancelled_flag()),
             on_success: Some(Box::new({
                 let run_handle = run_handle.clone();
                 move || run_handle.complete(Ok(()))
             })),
             on_error: Some(Box::new(move |error| run_handle.complete(Err(error)))),
+        }
+    }
+
+    fn runtime_child(
+        runner: Box<dyn FnOnce(&RuntimeCtx) -> Result<(), FlowError> + Send + 'static>,
+        runtime_cancelled: Arc<AtomicBool>,
+        runtime_join_scope: Arc<RuntimeJoinScope>,
+    ) -> Self {
+        Self {
+            runner: Some(runner),
+            runtime_cancelled,
+            runtime_join_scope: Some(runtime_join_scope),
+            skip_if_cancelled: None,
+            on_success: None,
+            on_error: None,
         }
     }
 
@@ -918,6 +1162,7 @@ impl ScheduledAsyncTask {
         Self {
             runner: Some(runner),
             runtime_cancelled,
+            runtime_join_scope: None,
             skip_if_cancelled: None,
             on_success: None,
             on_error: Some(on_error),
@@ -953,12 +1198,7 @@ impl RunState {
     }
 
     fn root_indices(&self) -> Vec<usize> {
-        self.graph
-            .nodes
-            .iter()
-            .enumerate()
-            .filter_map(|(index, node)| (node.total_predecessor_count == 0).then_some(index))
-            .collect()
+        self.graph.roots.clone()
     }
 
     fn record_error(&self, error: FlowError) {
@@ -982,25 +1222,12 @@ impl RunState {
 }
 
 fn worker_loop(worker_id: usize, inner: Arc<ExecutorInner>) {
+    inner.register_worker_thread(worker_id);
     let executor = Executor {
         inner: Arc::clone(&inner),
     };
-    let mut known_epoch = inner.notifier.current_epoch();
-    let mut continuation = None;
-
-    while !inner.shutdown.load(Ordering::Acquire) {
-        let task = continuation.take().or_else(|| inner.next_task(worker_id));
-        if let Some(task) = task {
-            continuation = inner.execute(&executor, worker_id, task);
-            continue;
-        }
-
-        inner.notify_worker_sleep(worker_id);
-        inner.notifier.wait(&mut known_epoch, &inner.shutdown);
-        if !inner.shutdown.load(Ordering::Acquire) {
-            inner.notify_worker_wake(worker_id);
-        }
-    }
+    let mut done = || inner.shutdown.load(Ordering::Acquire);
+    executor.drive_worker_until(worker_id, DriveMode::AllowPark, &mut done);
 }
 
 pub(crate) fn panic_payload_to_string(payload: Box<dyn Any + Send + 'static>) -> String {
@@ -1031,16 +1258,19 @@ fn execute_node_inline(
             )),
         },
         TaskKind::Runtime(task) => {
+            let runtime_join_scope = Arc::new(RuntimeJoinScope::default());
             let runtime = RuntimeCtx::new(
                 executor.clone(),
                 worker_id,
                 scheduler,
                 Arc::clone(&cancelled),
+                Arc::clone(&runtime_join_scope),
             );
             let _runtime_context = install_runtime_spawn_context(RuntimeSpawnContext {
                 executor: Arc::clone(&executor.inner),
                 worker_id,
                 cancelled,
+                join_scope: runtime_join_scope,
             });
             match panic::catch_unwind(AssertUnwindSafe(|| task(&runtime))) {
                 Ok(()) => Ok(None),
@@ -1105,12 +1335,7 @@ fn execute_graph_inline(
         .iter()
         .map(|node| node.predecessor_count)
         .collect();
-    let mut queue: VecDeque<usize> = graph
-        .nodes
-        .iter()
-        .enumerate()
-        .filter_map(|(index, node)| (node.total_predecessor_count == 0).then_some(index))
-        .collect();
+    let mut queue: VecDeque<usize> = graph.roots.iter().copied().collect();
     let mut outstanding = queue.len();
 
     while let Some(task_index) = queue.pop_front() {

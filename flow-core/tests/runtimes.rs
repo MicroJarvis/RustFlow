@@ -346,6 +346,36 @@ fn runtime_corun_handles_waits_for_all_children() {
 }
 
 #[test]
+fn runtime_corun_children_waits_for_all_silent_children() {
+    let executor = Executor::new(1);
+    let flow = Flow::new();
+    let hits = Arc::new(AtomicUsize::new(0));
+
+    {
+        let hits = Arc::clone(&hits);
+        flow.spawn_runtime(move |runtime| {
+            for _ in 0..4 {
+                let hits = Arc::clone(&hits);
+                runtime.silent_async(move |_| {
+                    hits.fetch_add(1, Ordering::SeqCst);
+                });
+            }
+
+            runtime
+                .corun_children()
+                .expect("runtime corun_children should succeed");
+        });
+    }
+
+    executor
+        .run(&flow)
+        .wait()
+        .expect("parent runtime flow should succeed");
+
+    assert_eq!(hits.load(Ordering::SeqCst), 4);
+}
+
+#[test]
 fn runtime_corun_handles_surfaces_child_panics() {
     let executor = Executor::new(1);
     let flow = Flow::new();
@@ -371,4 +401,65 @@ fn runtime_corun_handles_surfaces_child_panics() {
         .expect("parent runtime flow should succeed when panic is handled");
 
     assert!(saw_error.load(Ordering::SeqCst));
+}
+
+#[test]
+fn runtime_corun_children_surfaces_child_panics() {
+    let executor = Executor::new(1);
+    let flow = Flow::new();
+    let saw_error = Arc::new(AtomicBool::new(false));
+
+    {
+        let saw_error = Arc::clone(&saw_error);
+        flow.spawn_runtime(move |runtime| {
+            runtime.silent_async(|_| {
+                panic!("runtime silent async child boom");
+            });
+
+            let error = runtime
+                .corun_children()
+                .expect_err("runtime corun_children child panic should surface");
+            assert!(error.message().contains("runtime silent async child boom"));
+            saw_error.store(true, Ordering::SeqCst);
+        });
+    }
+
+    executor
+        .run(&flow)
+        .wait()
+        .expect("parent runtime flow should succeed when panic is handled");
+
+    assert!(saw_error.load(Ordering::SeqCst));
+}
+
+#[test]
+fn runtime_corun_children_does_not_deadlock_under_repeated_batches() {
+    let executor = Executor::new(4);
+    let flow = Flow::new();
+    let hits = Arc::new(AtomicUsize::new(0));
+
+    {
+        let hits = Arc::clone(&hits);
+        flow.spawn_runtime(move |runtime| {
+            for _ in 0..32 {
+                for _ in 0..8 {
+                    let hits = Arc::clone(&hits);
+                    runtime.silent_async(move |_| {
+                        hits.fetch_add(1, Ordering::SeqCst);
+                    });
+                }
+
+                runtime
+                    .corun_children()
+                    .expect("repeated runtime corun_children should succeed");
+            }
+        });
+    }
+
+    executor
+        .run(&flow)
+        .wait()
+        .expect("repeated runtime batches should complete");
+
+    assert_eq!(hits.load(Ordering::SeqCst), 32 * 8);
 }
