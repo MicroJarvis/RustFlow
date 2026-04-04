@@ -74,6 +74,39 @@ pub(crate) fn chunk_ranges_for_workers(
     chunks
 }
 
+pub(crate) fn chunk_ranges_aligned_to_workers(
+    range: Range<usize>,
+    options: ParallelForOptions,
+    workers: usize,
+) -> Vec<Range<usize>> {
+    match options.chunk_size {
+        ChunkSize::Fixed(_) => chunk_ranges_for_workers(range, options, workers),
+        ChunkSize::Auto => balanced_chunk_ranges_for_workers(range, workers),
+    }
+}
+
+fn balanced_chunk_ranges_for_workers(range: Range<usize>, workers: usize) -> Vec<Range<usize>> {
+    let len = range.end.saturating_sub(range.start);
+    if len == 0 {
+        return Vec::new();
+    }
+
+    let workers = workers.max(1).min(len);
+    let base = len / workers;
+    let remainder = len % workers;
+    let mut chunks = Vec::with_capacity(workers);
+    let mut chunk_start = range.start;
+
+    for worker_index in 0..workers {
+        let chunk_len = base + usize::from(worker_index < remainder);
+        let chunk_end = chunk_start + chunk_len;
+        chunks.push(chunk_start..chunk_end);
+        chunk_start = chunk_end;
+    }
+
+    chunks
+}
+
 pub trait ParallelForExt {
     fn parallel_for<F>(
         &self,

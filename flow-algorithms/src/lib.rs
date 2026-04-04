@@ -7,12 +7,15 @@
 
 mod find_scan_sort;
 mod parallel_for;
+mod partitioner;
 mod reduce_transform;
+mod write_once_buffer;
 
 pub use find_scan_sort::{
-    parallel_exclusive_scan, parallel_find, parallel_inclusive_scan, parallel_sort,
-    parallel_sort_by,
+    parallel_exclusive_scan, parallel_find, parallel_inclusive_scan, parallel_inclusive_scan_fast,
+    parallel_inclusive_scan_optimized, parallel_sort, parallel_sort_by,
 };
 pub use flow_core::*;
 pub use parallel_for::{ChunkSize, ParallelForExt, ParallelForOptions};
-pub use reduce_transform::{parallel_reduce, parallel_transform};
+pub use partitioner::{DynamicPartitioner, GuidedPartitioner, Partitioner, PartitionState, StaticPartitioner};
+pub use reduce_transform::{parallel_reduce, parallel_reduce_dynamic, parallel_transform};

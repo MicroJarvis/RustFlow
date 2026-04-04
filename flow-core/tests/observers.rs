@@ -58,15 +58,30 @@ fn observer_receives_task_and_worker_lifecycle_events() {
 
     std::thread::sleep(Duration::from_millis(20));
 
+    let wake_flow = Flow::new();
+    wake_flow.spawn(|| {}).name("C");
+    wake_flow.spawn(|| {}).name("D");
+
+    executor
+        .run(&wake_flow)
+        .wait()
+        .expect("observer wake flow should succeed");
+
+    std::thread::sleep(Duration::from_millis(20));
+
     let started = observer.started.lock().expect("started poisoned").clone();
     let finished = observer.finished.lock().expect("finished poisoned").clone();
 
-    assert_eq!(started.len(), 2);
-    assert_eq!(finished.len(), 2);
+    assert_eq!(started.len(), 4);
+    assert_eq!(finished.len(), 4);
     assert!(started.iter().any(|name| name == "A"));
     assert!(started.iter().any(|name| name == "B"));
+    assert!(started.iter().any(|name| name == "C"));
+    assert!(started.iter().any(|name| name == "D"));
     assert!(finished.iter().any(|name| name == "A"));
     assert!(finished.iter().any(|name| name == "B"));
+    assert!(finished.iter().any(|name| name == "C"));
+    assert!(finished.iter().any(|name| name == "D"));
     assert!(observer.sleeps.load(Ordering::SeqCst) > 0);
     assert!(observer.wakes.load(Ordering::SeqCst) > 0);
 }

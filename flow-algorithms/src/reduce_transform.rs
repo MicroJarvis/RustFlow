@@ -1,25 +1,14 @@
+use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex};
 
 use flow_core::{Executor, Flow, FlowError};
 
-use crate::parallel_for::{ParallelForOptions, chunk_ranges_for_workers};
+use crate::parallel_for::{ParallelForOptions, chunk_ranges_aligned_to_workers};
+use crate::partitioner::{DynamicPartitioner, Partitioner, PartitionState};
+use crate::write_once_buffer::WriteOnceBuffer;
 
-struct CompletionGuard {
-    remaining: Arc<AtomicUsize>,
-}
-
-impl CompletionGuard {
-    fn new(remaining: Arc<AtomicUsize>) -> Self {
-        Self { remaining }
-    }
-}
-
-impl Drop for CompletionGuard {
-    fn drop(&mut self) {
-        self.remaining.fetch_sub(1, Ordering::AcqRel);
-    }
-}
+const TRANSFORM_SEQUENTIAL_CUTOFF_PER_WORKER: usize = 8_192;
+const REDUCE_SEQUENTIAL_CUTOFF_PER_WORKER: usize = 8_192;
 
 pub fn parallel_transform<T, U, F>(
     executor: &Executor,
@@ -36,52 +25,34 @@ where
         return Ok(Vec::new());
     }
 
+    let workers = executor.num_workers().max(1);
+    if input.len() <= workers.saturating_mul(TRANSFORM_SEQUENTIAL_CUTOFF_PER_WORKER) {
+        return Ok(input.iter().map(|value| transform(value)).collect());
+    }
+
     let flow = Flow::new();
     let transform = Arc::new(transform);
-    let chunks = chunk_ranges_for_workers(0..input.len(), options, executor.num_workers());
-    let remaining = Arc::new(AtomicUsize::new(chunks.len()));
-    let output = Arc::new(
-        (0..input.len())
-            .map(|_| Mutex::new(None))
-            .collect::<Vec<_>>(),
-    );
+    let chunks = chunk_ranges_aligned_to_workers(0..input.len(), options, workers);
+    let output = Arc::new(WriteOnceBuffer::new(input.len()));
 
     for chunk in chunks {
         let input = Arc::clone(&input);
         let output = Arc::clone(&output);
         let transform = Arc::clone(&transform);
-        let remaining = Arc::clone(&remaining);
         let chunk_start = chunk.start;
         let chunk_end = chunk.end;
         flow.spawn(move || {
-            let _guard = CompletionGuard::new(Arc::clone(&remaining));
             for index in chunk_start..chunk_end {
                 let value = transform(&input[index]);
-                let mut slot = output[index]
-                    .lock()
-                    .expect("parallel transform slot poisoned");
-                if slot.replace(value).is_some() {
-                    panic!("parallel transform output assigned more than once");
-                }
+                output.write(index, value);
             }
         });
     }
 
-    let result = executor.run(&flow).wait();
-    while remaining.load(Ordering::Acquire) > 0 {
-        std::thread::yield_now();
-    }
-    result?;
+    executor.run(&flow).wait()?;
+    drop(flow);
 
-    Ok(output
-        .iter()
-        .map(|slot| {
-            slot.lock()
-                .expect("parallel transform slot poisoned")
-                .take()
-                .expect("parallel transform output should be initialized")
-        })
-        .collect())
+    Ok((0..input.len()).map(|index| output.take(index)).collect())
 }
 
 pub fn parallel_reduce<T, F>(
@@ -99,25 +70,29 @@ where
         return Ok(init);
     }
 
+    let workers = executor.num_workers().max(1);
+    if input.len() <= workers.saturating_mul(REDUCE_SEQUENTIAL_CUTOFF_PER_WORKER) {
+        let mut iter = input.iter().cloned();
+        let first = iter
+            .next()
+            .expect("parallel reduce sequential cutoff should preserve non-empty input");
+        let partial = iter.fold(first, |acc, value| reduce(acc, value));
+        return Ok(reduce(init, partial));
+    }
+
     let flow = Flow::new();
     let reduce = Arc::new(reduce);
-    let chunks = chunk_ranges_for_workers(0..input.len(), options, executor.num_workers());
-    let remaining = Arc::new(AtomicUsize::new(chunks.len()));
-    let partials = Arc::new(
-        (0..chunks.len())
-            .map(|_| Mutex::new(None))
-            .collect::<Vec<_>>(),
-    );
+    let chunks = chunk_ranges_aligned_to_workers(0..input.len(), options, workers);
+    let num_chunks = chunks.len();
+    let partials = Arc::new(WriteOnceBuffer::new(chunks.len()));
 
     for (chunk_index, chunk) in chunks.into_iter().enumerate() {
         let input = Arc::clone(&input);
         let partials = Arc::clone(&partials);
         let reduce = Arc::clone(&reduce);
-        let remaining = Arc::clone(&remaining);
         let chunk_start = chunk.start;
         let chunk_end = chunk.end;
         flow.spawn(move || {
-            let _guard = CompletionGuard::new(Arc::clone(&remaining));
             let mut iter = chunk_start..chunk_end;
             let first = iter
                 .next()
@@ -126,29 +101,96 @@ where
             for index in iter {
                 acc = reduce(acc, input[index].clone());
             }
-            let mut slot = partials[chunk_index]
-                .lock()
-                .expect("parallel reduce partial slot poisoned");
-            if slot.replace(acc).is_some() {
-                panic!("parallel reduce partial assigned more than once");
+            partials.write(chunk_index, acc);
+        });
+    }
+
+    executor.run(&flow).wait()?;
+    drop(flow);
+
+    Ok((0..num_chunks).fold(init, |acc, chunk_index| {
+        reduce(acc, partials.take(chunk_index))
+    }))
+}
+
+/// Parallel reduce with dynamic partitioning for better load balancing.
+///
+/// Unlike `parallel_reduce` which uses static pre-divided chunks,
+/// this version uses atomic fetch_add for chunk claiming, allowing
+/// fast workers to naturally help slow workers.
+///
+/// This is particularly useful when the work per element varies
+/// (e.g., is_prime for larger numbers takes longer).
+pub fn parallel_reduce_dynamic<T, F>(
+    executor: &Executor,
+    input: Arc<[T]>,
+    chunk_size: usize,
+    init: T,
+    reduce: F,
+) -> Result<T, FlowError>
+where
+    T: Send + Sync + Clone + 'static,
+    F: Fn(T, T) -> T + Send + Sync + 'static,
+{
+    if input.is_empty() {
+        return Ok(init);
+    }
+
+    let workers = executor.num_workers().max(1);
+    if input.len() <= workers.saturating_mul(REDUCE_SEQUENTIAL_CUTOFF_PER_WORKER) {
+        let mut iter = input.iter().cloned();
+        let first = iter
+            .next()
+            .expect("parallel reduce sequential cutoff should preserve non-empty input");
+        let partial = iter.fold(first, |acc, value| reduce(acc, value));
+        return Ok(reduce(init, partial));
+    }
+
+    let flow = Flow::new();
+    let reduce = Arc::new(reduce);
+
+    // Shared state for dynamic partitioning
+    let state = Arc::new(PartitionState::new(input.len()));
+    let partitioner = Arc::new(DynamicPartitioner::new(chunk_size));
+
+    // Track how many partials have been written
+    let partial_count = Arc::new(AtomicUsize::new(0));
+    // Pre-allocate space for partials (worst case: input.len() / chunk_size + workers)
+    let max_partials = (input.len() / chunk_size).max(1) + workers;
+    let partials = Arc::new(WriteOnceBuffer::new(max_partials));
+
+    // Spawn worker tasks
+    for _ in 0..workers {
+        let input = Arc::clone(&input);
+        let partials = Arc::clone(&partials);
+        let reduce = Arc::clone(&reduce);
+        let state = Arc::clone(&state);
+        let partitioner = Arc::clone(&partitioner);
+        let partial_count = Arc::clone(&partial_count);
+
+        flow.spawn(move || {
+            // Keep claiming chunks until exhausted
+            while let Some(chunk) = partitioner.next_chunk(&state) {
+                let mut iter = chunk.start..chunk.end;
+                if let Some(first) = iter.next() {
+                    let mut acc = input[first].clone();
+                    for index in iter {
+                        acc = reduce(acc, input[index].clone());
+                    }
+                    // Write partial result
+                    let partial_index = partial_count.fetch_add(1, Ordering::AcqRel);
+                    partials.write(partial_index, acc);
+                }
             }
         });
     }
 
-    let result = executor.run(&flow).wait();
-    while remaining.load(Ordering::Acquire) > 0 {
-        std::thread::yield_now();
-    }
-    result?;
+    executor.run(&flow).wait()?;
+    drop(flow);
 
-    Ok(partials.iter().fold(init, |acc, partial| {
-        reduce(
-            acc,
-            partial
-                .lock()
-                .expect("parallel reduce partial slot poisoned")
-                .take()
-                .expect("parallel reduce partial should be initialized"),
-        )
+    // Combine all partials
+    let num_partials = partial_count.load(Ordering::Acquire);
+    Ok((0..num_partials).fold(init, |acc, index| {
+        reduce(acc, partials.take(index))
     }))
 }

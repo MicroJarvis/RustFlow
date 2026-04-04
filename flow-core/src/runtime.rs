@@ -6,6 +6,7 @@ use crate::async_handle::{AsyncHandle, RuntimeAsyncState};
 use crate::error::FlowError;
 use crate::executor::{Executor, RunHandle};
 use crate::flow::{Flow, TaskHandle, TaskId};
+use crate::task_group::TaskGroup;
 
 type RuntimeScheduler = Arc<dyn Fn(TaskId) + Send + Sync + 'static>;
 
@@ -119,6 +120,18 @@ impl RuntimeCtx {
         );
     }
 
+    pub(crate) fn silent_result_async<F>(&self, task: F)
+    where
+        F: FnOnce(&RuntimeCtx) -> Result<(), FlowError> + Send + 'static,
+    {
+        self.executor.schedule_runtime_silent_child(
+            Box::new(task),
+            self.worker_id,
+            Arc::clone(&self.cancelled),
+            Arc::clone(&self.join_scope),
+        );
+    }
+
     pub fn corun_children(&self) -> Result<(), FlowError> {
         self.executor
             .wait_until_inline(self.worker_id, || self.join_scope.is_idle());
@@ -145,5 +158,24 @@ impl RuntimeCtx {
 
     pub(crate) fn cancelled_flag(&self) -> Arc<AtomicBool> {
         Arc::clone(&self.cancelled)
+    }
+
+    /// Create a lightweight TaskGroup for spawning parallel tasks.
+    ///
+    /// TaskGroup provides a simpler API than `silent_async`:
+    /// - Closures don't need a RuntimeCtx parameter
+    /// - Uses embedded join counter for tracking
+    /// - Supports cancellation
+    ///
+    /// # Example
+    ///
+    /// ```ignore
+    /// let tg = runtime.task_group();
+    /// tg.silent_async(|| { /* task 1 */ });
+    /// tg.silent_async(|| { /* task 2 */ });
+    /// tg.corun()?; // Wait for both tasks
+    /// ```
+    pub fn task_group(&self) -> TaskGroup {
+        TaskGroup::new(self.executor.clone(), self.worker_id)
     }
 }

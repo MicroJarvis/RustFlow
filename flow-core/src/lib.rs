@@ -8,7 +8,9 @@ mod observer;
 mod pipeline;
 mod runtime;
 mod semaphore;
+mod task_group;
 mod trace;
+mod util;
 
 pub use async_handle::AsyncHandle;
 pub use async_task::AsyncTask;
@@ -22,4 +24,6 @@ pub use observer::Observer;
 pub use pipeline::{DataPipeline, Pipe, PipeContext, PipeType, Pipeline, ScalablePipeline};
 pub use runtime::RuntimeCtx;
 pub use semaphore::Semaphore;
+pub use task_group::TaskGroup;
 pub use trace::TraceObserver;
+pub use util::CachelineAligned;

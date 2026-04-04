@@ -128,3 +128,51 @@ fn data_pipeline_moves_values_between_stages() {
     }
     assert_eq!(outputs[5].load(Ordering::SeqCst), 0);
 }
+
+#[test]
+fn data_pipeline_supports_heterogeneous_stage_storage() {
+    #[derive(Clone)]
+    struct LargePayload([usize; 8]);
+
+    let executor = Executor::new(4);
+    let outputs = Arc::new((0..5).map(|_| AtomicUsize::new(0)).collect::<Vec<_>>());
+
+    let pipeline = DataPipeline::builder(2)
+        .source(PipeType::Serial, |ctx| -> usize {
+            if ctx.token() == 4 {
+                ctx.stop();
+                return 0;
+            }
+            ctx.token()
+        })
+        .stage(PipeType::Parallel, |value: &mut usize, _ctx| -> String {
+            (*value + 1).to_string()
+        })
+        .stage(
+            PipeType::Parallel,
+            |value: &mut String, _ctx| -> LargePayload {
+                LargePayload([value.parse::<usize>().expect("value should be numeric"); 8])
+            },
+        )
+        .stage(
+            PipeType::Parallel,
+            |value: &mut LargePayload, _ctx| -> usize { value.0[0] },
+        )
+        .sink(PipeType::Serial, {
+            let outputs = Arc::clone(&outputs);
+            move |value: &mut usize, ctx| {
+                outputs[ctx.token()].store(*value, Ordering::SeqCst);
+            }
+        });
+
+    pipeline
+        .run(&executor)
+        .wait()
+        .expect("heterogeneous data pipeline run should succeed");
+
+    assert_eq!(pipeline.num_tokens(), 4);
+    for token in 0..4 {
+        assert_eq!(outputs[token].load(Ordering::SeqCst), token + 1);
+    }
+    assert_eq!(outputs[4].load(Ordering::SeqCst), 0);
+}

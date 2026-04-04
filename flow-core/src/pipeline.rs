@@ -1,15 +1,62 @@
-use std::any::Any;
+use std::cell::UnsafeCell;
 use std::marker::PhantomData;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::mem::MaybeUninit;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
-use std::thread;
 
 use crate::Executor;
 use crate::error::FlowError;
 use crate::executor::RunHandle;
+use crate::runtime::RuntimeCtx;
 
-type DataPayload = Box<dyn Any + Send>;
-type DataPayloadSlot = Option<DataPayload>;
+struct LineSlot<T> {
+    values: Vec<UnsafeCell<MaybeUninit<T>>>,
+    initialized: Vec<AtomicBool>,
+}
+
+unsafe impl<T: Send> Send for LineSlot<T> {}
+unsafe impl<T: Send> Sync for LineSlot<T> {}
+
+impl<T> LineSlot<T> {
+    fn new(num_lines: usize) -> Self {
+        Self {
+            values: (0..num_lines)
+                .map(|_| UnsafeCell::new(MaybeUninit::uninit()))
+                .collect(),
+            initialized: (0..num_lines).map(|_| AtomicBool::new(false)).collect(),
+        }
+    }
+
+    fn write(&self, line: usize, value: T) {
+        if self.initialized[line].swap(true, Ordering::AcqRel) {
+            panic!("data pipeline line slot written before previous value was consumed");
+        }
+
+        unsafe {
+            (*self.values[line].get()).write(value);
+        }
+    }
+
+    fn take(&self, line: usize) -> T {
+        if !self.initialized[line].swap(false, Ordering::AcqRel) {
+            panic!("data pipeline line slot should be initialized before use");
+        }
+
+        unsafe { (*self.values[line].get()).assume_init_read() }
+    }
+}
+
+impl<T> Drop for LineSlot<T> {
+    fn drop(&mut self) {
+        for line in 0..self.values.len() {
+            if self.initialized[line].load(Ordering::Acquire) {
+                unsafe {
+                    self.values[line].get_mut().assume_init_drop();
+                }
+            }
+        }
+    }
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum PipeType {
@@ -132,18 +179,16 @@ impl Pipeline {
 
     pub fn run(&self, executor: &Executor) -> RunHandle {
         let pipeline = self.clone();
-        let executor = executor.clone();
-        spawn_run_handle(move |cancelled| {
+        executor.schedule_runtime_runner(Box::new(move |runtime| {
             let _run_guard = lock_unpoisoned(&pipeline.inner.run_lock);
             *lock_unpoisoned(&pipeline.inner.num_tokens) = 0;
             run_pipe_chain(
-                &executor,
+                runtime,
                 pipeline.inner.num_lines,
                 pipeline.inner.pipes.clone(),
                 &pipeline.inner.num_tokens,
-                cancelled,
             )
-        })
+        }))
     }
 }
 
@@ -226,8 +271,7 @@ impl ScalablePipeline {
 
     pub fn run(&self, executor: &Executor) -> RunHandle {
         let pipeline = self.clone();
-        let executor = executor.clone();
-        spawn_run_handle(move |cancelled| {
+        executor.schedule_runtime_runner(Box::new(move |runtime| {
             let _run_guard = lock_unpoisoned(&pipeline.inner.run_lock);
             *lock_unpoisoned(&pipeline.inner.num_tokens) = 0;
             let config = lock_unpoisoned(&pipeline.inner.config).clone();
@@ -236,76 +280,153 @@ impl ScalablePipeline {
             }
 
             run_pipe_chain(
-                &executor,
+                runtime,
                 config.num_lines,
                 config.pipes,
                 &pipeline.inner.num_tokens,
-                cancelled,
             )
-        })
+        }))
     }
 }
 
 #[derive(Clone)]
 struct DataStage {
+    runner: Arc<dyn DataStageRunner>,
+}
+
+trait DataStageRunner: Send + Sync {
+    fn pipe_type(&self) -> PipeType;
+    fn run(&self, line: usize, context: &mut PipeContext);
+}
+
+struct SourceDataStage<O, F> {
     pipe_type: PipeType,
-    task: Arc<dyn Fn(DataPayloadSlot, &mut PipeContext) -> DataPayloadSlot + Send + Sync + 'static>,
+    task: F,
+    output: Arc<LineSlot<O>>,
+}
+
+impl<O, F> DataStageRunner for SourceDataStage<O, F>
+where
+    O: Send + 'static,
+    F: Fn(&mut PipeContext) -> O + Send + Sync + 'static,
+{
+    fn pipe_type(&self) -> PipeType {
+        self.pipe_type
+    }
+
+    fn run(&self, line: usize, context: &mut PipeContext) {
+        self.output.write(line, (self.task)(context));
+    }
+}
+
+struct TransformDataStage<I, O, F> {
+    pipe_type: PipeType,
+    task: F,
+    input: Arc<LineSlot<I>>,
+    output: Arc<LineSlot<O>>,
+}
+
+impl<I, O, F> DataStageRunner for TransformDataStage<I, O, F>
+where
+    I: Send + 'static,
+    O: Send + 'static,
+    F: Fn(&mut I, &mut PipeContext) -> O + Send + Sync + 'static,
+{
+    fn pipe_type(&self) -> PipeType {
+        self.pipe_type
+    }
+
+    fn run(&self, line: usize, context: &mut PipeContext) {
+        let mut input = self.input.take(line);
+        self.output.write(line, (self.task)(&mut input, context));
+    }
+}
+
+struct SinkDataStage<I, F> {
+    pipe_type: PipeType,
+    task: F,
+    input: Arc<LineSlot<I>>,
+}
+
+impl<I, F> DataStageRunner for SinkDataStage<I, F>
+where
+    I: Send + 'static,
+    F: Fn(&mut I, &mut PipeContext) + Send + Sync + 'static,
+{
+    fn pipe_type(&self) -> PipeType {
+        self.pipe_type
+    }
+
+    fn run(&self, line: usize, context: &mut PipeContext) {
+        let mut input = self.input.take(line);
+        (self.task)(&mut input, context);
+    }
 }
 
 impl DataStage {
-    fn source<O, F>(pipe_type: PipeType, task: F) -> Self
+    fn source<O, F>(num_lines: usize, pipe_type: PipeType, task: F) -> (Self, Arc<LineSlot<O>>)
     where
         O: Send + 'static,
         F: Fn(&mut PipeContext) -> O + Send + Sync + 'static,
     {
-        Self {
-            pipe_type,
-            task: Arc::new(move |_input, context| Some(Box::new(task(context)))),
-        }
+        let output = Arc::new(LineSlot::new(num_lines));
+        (
+            Self {
+                runner: Arc::new(SourceDataStage {
+                    pipe_type,
+                    task,
+                    output: Arc::clone(&output),
+                }),
+            },
+            output,
+        )
     }
 
-    fn stage<I, O, F>(pipe_type: PipeType, task: F) -> Self
+    fn stage<I, O, F>(
+        num_lines: usize,
+        pipe_type: PipeType,
+        input: Arc<LineSlot<I>>,
+        task: F,
+    ) -> (Self, Arc<LineSlot<O>>)
     where
         I: Send + 'static,
         O: Send + 'static,
         F: Fn(&mut I, &mut PipeContext) -> O + Send + Sync + 'static,
     {
-        Self {
-            pipe_type,
-            task: Arc::new(move |input, context| {
-                let input = input.expect("data pipeline stage expected an input payload");
-                let mut input = *input
-                    .downcast::<I>()
-                    .expect("data pipeline stage input type mismatch");
-                Some(Box::new(task(&mut input, context)))
-            }),
-        }
+        let output = Arc::new(LineSlot::new(num_lines));
+        (
+            Self {
+                runner: Arc::new(TransformDataStage {
+                    pipe_type,
+                    task,
+                    input,
+                    output: Arc::clone(&output),
+                }),
+            },
+            output,
+        )
     }
 
-    fn sink<I, F>(pipe_type: PipeType, task: F) -> Self
+    fn sink<I, F>(pipe_type: PipeType, input: Arc<LineSlot<I>>, task: F) -> Self
     where
         I: Send + 'static,
         F: Fn(&mut I, &mut PipeContext) + Send + Sync + 'static,
     {
         Self {
-            pipe_type,
-            task: Arc::new(move |input, context| {
-                let input = input.expect("data pipeline sink expected an input payload");
-                let mut input = *input
-                    .downcast::<I>()
-                    .expect("data pipeline sink input type mismatch");
-                task(&mut input, context);
-                None
+            runner: Arc::new(SinkDataStage {
+                pipe_type,
+                task,
+                input,
             }),
         }
     }
 
     fn pipe_type(&self) -> PipeType {
-        self.pipe_type
+        self.runner.pipe_type()
     }
 
-    fn run(&self, input: DataPayloadSlot, context: &mut PipeContext) -> DataPayloadSlot {
-        (self.task)(input, context)
+    fn run(&self, line: usize, context: &mut PipeContext) {
+        self.runner.run(line, context);
     }
 }
 
@@ -327,6 +448,7 @@ impl DataPipeline {
         DataPipelineBuilder {
             num_lines,
             stages: Vec::new(),
+            output_slot: None,
             _marker: PhantomData,
         }
     }
@@ -350,19 +472,17 @@ impl DataPipeline {
 
     pub fn run(&self, executor: &Executor) -> RunHandle {
         let pipeline = self.clone();
-        let executor = executor.clone();
-        spawn_run_handle(move |cancelled| {
+        executor.schedule_runtime_runner(Box::new(move |runtime| {
             let _run_guard = lock_unpoisoned(&pipeline.inner.run_lock);
             *lock_unpoisoned(&pipeline.inner.num_tokens) = 0;
 
             run_data_chain(
-                &executor,
+                runtime,
                 pipeline.inner.num_lines,
                 pipeline.inner.stages.clone(),
                 &pipeline.inner.num_tokens,
-                cancelled,
             )
-        })
+        }))
     }
 
     fn from_stages(num_lines: usize, stages: Vec<DataStage>) -> Self {
@@ -382,6 +502,7 @@ impl DataPipeline {
 pub struct DataPipelineBuilder<I> {
     num_lines: usize,
     stages: Vec<DataStage>,
+    output_slot: Option<Arc<LineSlot<I>>>,
     _marker: PhantomData<fn() -> I>,
 }
 
@@ -391,10 +512,12 @@ impl DataPipelineBuilder<()> {
         O: Send + 'static,
         F: Fn(&mut PipeContext) -> O + Send + Sync + 'static,
     {
-        self.stages.push(DataStage::source(pipe_type, task));
+        let (stage, output_slot) = DataStage::source(self.num_lines, pipe_type, task);
+        self.stages.push(stage);
         DataPipelineBuilder {
             num_lines: self.num_lines,
             stages: self.stages,
+            output_slot: Some(output_slot),
             _marker: PhantomData,
         }
     }
@@ -409,10 +532,16 @@ where
         O: Send + 'static,
         F: Fn(&mut I, &mut PipeContext) -> O + Send + Sync + 'static,
     {
-        self.stages.push(DataStage::stage(pipe_type, task));
+        let input = self
+            .output_slot
+            .take()
+            .expect("data pipeline stage expected a preceding output slot");
+        let (stage, output_slot) = DataStage::stage(self.num_lines, pipe_type, input, task);
+        self.stages.push(stage);
         DataPipelineBuilder {
             num_lines: self.num_lines,
             stages: self.stages,
+            output_slot: Some(output_slot),
             _marker: PhantomData,
         }
     }
@@ -421,7 +550,11 @@ where
     where
         F: Fn(&mut I, &mut PipeContext) + Send + Sync + 'static,
     {
-        self.stages.push(DataStage::sink(pipe_type, task));
+        let input = self
+            .output_slot
+            .take()
+            .expect("data pipeline sink expected a preceding output slot");
+        self.stages.push(DataStage::sink(pipe_type, input, task));
         DataPipeline::from_stages(self.num_lines, self.stages)
     }
 
@@ -431,7 +564,7 @@ where
 }
 
 struct PipelineRunState {
-    next_token: Mutex<usize>,
+    next_token: AtomicUsize,
     stopped: AtomicBool,
     cancelled: Arc<AtomicBool>,
     stage_locks: Vec<Option<Mutex<()>>>,
@@ -440,7 +573,7 @@ struct PipelineRunState {
 impl PipelineRunState {
     fn new(stage_locks: Vec<Option<Mutex<()>>>, cancelled: Arc<AtomicBool>) -> Self {
         Self {
-            next_token: Mutex::new(0),
+            next_token: AtomicUsize::new(0),
             stopped: AtomicBool::new(false),
             cancelled,
             stage_locks,
@@ -458,11 +591,10 @@ impl PipelineRunState {
 }
 
 fn run_pipe_chain(
-    executor: &Executor,
+    runtime: &RuntimeCtx,
     num_lines: usize,
     pipes: Vec<Pipe>,
     num_tokens: &Mutex<usize>,
-    cancelled: Arc<AtomicBool>,
 ) -> Result<(), FlowError> {
     let pipes: Arc<[Pipe]> = Arc::from(pipes);
     let run_state = Arc::new(PipelineRunState::new(
@@ -470,19 +602,35 @@ fn run_pipe_chain(
             .iter()
             .map(|pipe| (pipe.pipe_type() == PipeType::Serial).then_some(Mutex::new(())))
             .collect(),
-        cancelled,
+        runtime.cancelled_flag(),
     ));
 
-    let handles = (0..num_lines)
-        .map(|line| {
-            let pipes = Arc::clone(&pipes);
-            let run_state = Arc::clone(&run_state);
-            executor.async_task(move || run_pipe_line(pipes, line, run_state))
-        })
-        .collect::<Vec<_>>();
+    for line in 1..num_lines {
+        let pipes = Arc::clone(&pipes);
+        let run_state = Arc::clone(&run_state);
+        runtime.silent_result_async(move |_| {
+            let result = run_pipe_line(pipes, line, Arc::clone(&run_state));
+            if result.is_err() {
+                run_state.request_stop();
+            }
+            result
+        });
+    }
 
-    let result = wait_pipeline_handles(handles, &run_state);
-    *lock_unpoisoned(num_tokens) = *lock_unpoisoned(&run_state.next_token);
+    let inline_result = run_pipe_line(Arc::clone(&pipes), 0, Arc::clone(&run_state));
+    if inline_result.is_err() {
+        run_state.request_stop();
+    }
+
+    let children_result = runtime.corun_children();
+    let result = match inline_result {
+        Ok(()) => children_result,
+        Err(error) => {
+            let _ = children_result;
+            Err(error)
+        }
+    };
+    *lock_unpoisoned(num_tokens) = run_state.next_token.load(Ordering::Acquire);
     result
 }
 
@@ -514,8 +662,8 @@ fn run_pipe_line(
                 return Ok(());
             }
 
-            let mut next_token = lock_unpoisoned(&run_state.next_token);
-            context.token = *next_token;
+            let next_token = run_state.next_token.load(Ordering::Acquire);
+            context.token = next_token;
             pipes[0].run(&mut context);
 
             if context.stop_requested {
@@ -523,7 +671,9 @@ fn run_pipe_line(
                 return Ok(());
             }
 
-            *next_token += 1;
+            run_state
+                .next_token
+                .store(next_token + 1, Ordering::Release);
         }
 
         // Once a line has claimed a token from stage 0, let it drain through the
@@ -541,11 +691,10 @@ fn run_pipe_line(
 }
 
 fn run_data_chain(
-    executor: &Executor,
+    runtime: &RuntimeCtx,
     num_lines: usize,
     stages: Vec<DataStage>,
     num_tokens: &Mutex<usize>,
-    cancelled: Arc<AtomicBool>,
 ) -> Result<(), FlowError> {
     let stages: Arc<[DataStage]> = Arc::from(stages);
     let run_state = Arc::new(PipelineRunState::new(
@@ -553,19 +702,35 @@ fn run_data_chain(
             .iter()
             .map(|stage| (stage.pipe_type() == PipeType::Serial).then_some(Mutex::new(())))
             .collect(),
-        cancelled,
+        runtime.cancelled_flag(),
     ));
 
-    let handles = (0..num_lines)
-        .map(|line| {
-            let stages = Arc::clone(&stages);
-            let run_state = Arc::clone(&run_state);
-            executor.async_task(move || run_data_line(stages, line, run_state))
-        })
-        .collect::<Vec<_>>();
+    for line in 1..num_lines {
+        let stages = Arc::clone(&stages);
+        let run_state = Arc::clone(&run_state);
+        runtime.silent_result_async(move |_| {
+            let result = run_data_line(stages, line, Arc::clone(&run_state));
+            if result.is_err() {
+                run_state.request_stop();
+            }
+            result
+        });
+    }
 
-    let result = wait_pipeline_handles(handles, &run_state);
-    *lock_unpoisoned(num_tokens) = *lock_unpoisoned(&run_state.next_token);
+    let inline_result = run_data_line(Arc::clone(&stages), 0, Arc::clone(&run_state));
+    if inline_result.is_err() {
+        run_state.request_stop();
+    }
+
+    let children_result = runtime.corun_children();
+    let result = match inline_result {
+        Ok(()) => children_result,
+        Err(error) => {
+            let _ = children_result;
+            Err(error)
+        }
+    };
+    *lock_unpoisoned(num_tokens) = run_state.next_token.load(Ordering::Acquire);
     result
 }
 
@@ -585,7 +750,7 @@ fn run_data_line(
             token: 0,
             stop_requested: false,
         };
-        let mut payload = {
+        {
             let _stage_guard = lock_unpoisoned(
                 run_state.stage_locks[0]
                     .as_ref()
@@ -596,18 +761,19 @@ fn run_data_line(
                 return Ok(());
             }
 
-            let mut next_token = lock_unpoisoned(&run_state.next_token);
-            context.token = *next_token;
-            let payload = stages[0].run(None, &mut context);
+            let next_token = run_state.next_token.load(Ordering::Acquire);
+            context.token = next_token;
+            stages[0].run(line, &mut context);
 
             if context.stop_requested {
                 run_state.request_stop();
                 return Ok(());
             }
 
-            *next_token += 1;
-            payload
-        };
+            run_state
+                .next_token
+                .store(next_token + 1, Ordering::Release);
+        }
 
         // Once a line has claimed a token from stage 0, let it drain through the
         // remaining stages before honoring a global stop or cancellation request.
@@ -615,54 +781,12 @@ fn run_data_line(
             context.pipe = pipe_index;
             if let Some(stage_lock) = &run_state.stage_locks[pipe_index] {
                 let _stage_guard = lock_unpoisoned(stage_lock);
-                payload = stages[pipe_index].run(payload, &mut context);
+                stages[pipe_index].run(line, &mut context);
             } else {
-                payload = stages[pipe_index].run(payload, &mut context);
+                stages[pipe_index].run(line, &mut context);
             }
         }
     }
-}
-
-fn wait_pipeline_handles<T>(
-    handles: Vec<crate::AsyncHandle<Result<T, FlowError>>>,
-    run_state: &Arc<PipelineRunState>,
-) -> Result<T, FlowError> {
-    let mut first_error = None;
-    let mut last_value = None;
-
-    for handle in handles {
-        match handle.wait() {
-            Ok(Ok(value)) => last_value = Some(value),
-            Ok(Err(error)) | Err(error) => {
-                run_state.request_stop();
-                if first_error.is_none() {
-                    first_error = Some(error);
-                }
-            }
-        }
-    }
-
-    if let Some(error) = first_error {
-        Err(error)
-    } else {
-        Ok(last_value.expect("pipeline worker tasks should produce a completion marker"))
-    }
-}
-
-fn spawn_run_handle<F>(run: F) -> RunHandle
-where
-    F: FnOnce(Arc<AtomicBool>) -> Result<(), FlowError> + Send + 'static,
-{
-    let handle = RunHandle::pending();
-    let cancelled = handle.cancelled_flag();
-    let handle_clone = handle.clone();
-
-    thread::spawn(move || {
-        let result = run(cancelled);
-        handle_clone.complete(result);
-    });
-
-    handle
 }
 
 fn validate_pipe_config(num_lines: usize, pipes: &[Pipe]) {

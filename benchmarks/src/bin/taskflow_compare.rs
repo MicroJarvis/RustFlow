@@ -12,10 +12,9 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use flow_algorithms::{
-    DataPipeline, Executor, Flow, ParallelForOptions, Pipe, PipeType, Pipeline, RuntimeCtx,
-    TaskHandle,
-    ParallelForExt, parallel_inclusive_scan, parallel_reduce, parallel_sort,
-    parallel_transform,
+    DataPipeline, DynamicPartitioner, Executor, Flow, ParallelForExt, ParallelForOptions,
+    Partitioner, PartitionState, Pipe, PipeType, Pipeline, RuntimeCtx, TaskHandle,
+    parallel_inclusive_scan, parallel_reduce, parallel_sort, parallel_transform,
 };
 
 unsafe extern "C" {
@@ -154,7 +153,8 @@ fn parse_args(args: Vec<String>) -> Config {
             }
             "--output-dir" => {
                 index += 1;
-                output_dir = PathBuf::from(args.get(index).expect("missing value for --output-dir"));
+                output_dir =
+                    PathBuf::from(args.get(index).expect("missing value for --output-dir"));
             }
             "--cases" => {
                 index += 1;
@@ -281,10 +281,12 @@ impl TaskflowHarness {
         }
 
         let needs_rebuild = match (fs::metadata(&source_path), fs::metadata(&binary_path)) {
-            (Ok(source_meta), Ok(binary_meta)) => match (source_meta.modified(), binary_meta.modified()) {
-                (Ok(source_time), Ok(binary_time)) => source_time > binary_time,
-                _ => true,
-            },
+            (Ok(source_meta), Ok(binary_meta)) => {
+                match (source_meta.modified(), binary_meta.modified()) {
+                    (Ok(source_time), Ok(binary_time)) => source_time > binary_time,
+                    _ => true,
+                }
+            }
             _ => true,
         };
 
@@ -316,7 +318,9 @@ impl TaskflowHarness {
     }
 
     fn benchmark_cpp(&self, relative: &str) -> PathBuf {
-        self.workspace_root.join("taskflow/benchmarks").join(relative)
+        self.workspace_root
+            .join("taskflow/benchmarks")
+            .join(relative)
     }
 }
 
@@ -460,8 +464,14 @@ fn render_markdown(config: &Config, cases: &[CaseResult]) -> String {
     let _ = writeln!(out, "- Profile: {:?}", config.profile);
     let _ = writeln!(out, "- Threads: {}", config.threads);
     let _ = writeln!(out, "- Rounds per point: {}", config.rounds);
-    let _ = writeln!(out, "- Ratio column: RustFlow ms / Taskflow ms (smaller is better)");
-    let _ = writeln!(out, "- Method note: benchmark structure matches `taskflow/benchmarks`, but very large default sweeps are capped in this report profile for practical execution.");
+    let _ = writeln!(
+        out,
+        "- Ratio column: RustFlow ms / Taskflow ms (smaller is better)"
+    );
+    let _ = writeln!(
+        out,
+        "- Method note: benchmark structure matches `taskflow/benchmarks`, but very large default sweeps are capped in this report profile for practical execution."
+    );
     let _ = writeln!(out);
 
     for case in cases {
@@ -474,11 +484,16 @@ fn render_markdown(config: &Config, cases: &[CaseResult]) -> String {
         let _ = writeln!(out);
 
         if !case.points.is_empty() {
-            let _ = writeln!(out, "| Size | RustFlow (ms) | Taskflow (ms) | Ratio | Note |");
+            let _ = writeln!(
+                out,
+                "| Size | RustFlow (ms) | Taskflow (ms) | Ratio | Note |"
+            );
             let _ = writeln!(out, "| ---: | ---: | ---: | ---: | --- |");
             for point in &case.points {
                 let ratio = match (point.rustflow_ms, point.taskflow_ms) {
-                    (Some(rust), Some(taskflow)) if taskflow > 0.0 => format!("{:.3}", rust / taskflow),
+                    (Some(rust), Some(taskflow)) if taskflow > 0.0 => {
+                        format!("{:.3}", rust / taskflow)
+                    }
                     _ => "-".to_string(),
                 };
                 let _ = writeln!(
@@ -634,29 +649,39 @@ where
 }
 
 fn checksum_u8(values: &[u8]) -> u64 {
-    values.iter().fold(1_469_598_103_934_665_603u64, |acc, value| {
-        acc.wrapping_mul(1_099_511_628_211).wrapping_add(*value as u64)
-    })
+    values
+        .iter()
+        .fold(1_469_598_103_934_665_603u64, |acc, value| {
+            acc.wrapping_mul(1_099_511_628_211)
+                .wrapping_add(*value as u64)
+        })
 }
 
 fn checksum_i32(values: &[i32]) -> u64 {
-    values.iter().fold(1_469_598_103_934_665_603u64, |acc, value| {
-        acc.wrapping_mul(1_099_511_628_211)
-            .wrapping_add(*value as u32 as u64)
-    })
+    values
+        .iter()
+        .fold(1_469_598_103_934_665_603u64, |acc, value| {
+            acc.wrapping_mul(1_099_511_628_211)
+                .wrapping_add(*value as u32 as u64)
+        })
 }
 
 fn checksum_f64(values: &[f64]) -> u64 {
-    values.iter().fold(1_469_598_103_934_665_603u64, |acc, value| {
-        acc.wrapping_mul(1_099_511_628_211).wrapping_add(value.to_bits())
-    })
+    values
+        .iter()
+        .fold(1_469_598_103_934_665_603u64, |acc, value| {
+            acc.wrapping_mul(1_099_511_628_211)
+                .wrapping_add(value.to_bits())
+        })
 }
 
 fn checksum_f32(values: &[f32]) -> u64 {
-    values.iter().fold(1_469_598_103_934_665_603u64, |acc, value| {
-        acc.wrapping_mul(1_099_511_628_211)
-            .wrapping_add(value.to_bits() as u64)
-    })
+    values
+        .iter()
+        .fold(1_469_598_103_934_665_603u64, |acc, value| {
+            acc.wrapping_mul(1_099_511_628_211)
+                .wrapping_add(value.to_bits() as u64)
+        })
 }
 
 fn auto_chunk_size_for_workers(len: usize, workers: usize) -> usize {
@@ -884,8 +909,10 @@ fn run_for_each_flow(executor: &Executor, values: &mut [f64]) -> Result<(), Stri
 
     let flow = Flow::new();
     let values_ptr = SharedMutPtr::from_slice(values);
-    let options = ParallelForOptions::default()
-        .with_chunk_size(auto_chunk_size_for_workers(values.len(), executor.num_workers()));
+    let options = ParallelForOptions::default().with_chunk_size(auto_chunk_size_for_workers(
+        values.len(),
+        executor.num_workers(),
+    ));
 
     let _tasks = flow.parallel_for(0..values.len(), options, move |index| unsafe {
         values_ptr.update(index, |value| {
@@ -893,7 +920,10 @@ fn run_for_each_flow(executor: &Executor, values: &mut [f64]) -> Result<(), Stri
         });
     });
 
-    executor.run(&flow).wait().map_err(|error| error.to_string())
+    executor
+        .run(&flow)
+        .wait()
+        .map_err(|error| error.to_string())
 }
 
 fn build_black_scholes_flow(
@@ -980,7 +1010,8 @@ impl LevelGraph {
 
         for level in 0..levels.saturating_sub(1) {
             for index in 0..length {
-                for (edge_index, destination) in out_edges[level][index].iter().copied().enumerate() {
+                for (edge_index, destination) in out_edges[level][index].iter().copied().enumerate()
+                {
                     in_edges[level + 1][destination].push((index, edge_index));
                 }
             }
@@ -996,9 +1027,7 @@ impl LevelGraph {
     fn graph_size(&self) -> usize {
         self.out_edges
             .iter()
-            .map(|level| {
-                level.iter().map(|edges| 1 + edges.len()).sum::<usize>()
-            })
+            .map(|level| level.iter().map(|edges| 1 + edges.len()).sum::<usize>())
             .sum()
     }
 
@@ -1093,7 +1122,10 @@ fn run_binary_tree_case(config: &Config, harness: &TaskflowHarness) -> CaseResul
     compare_case(
         "binary_tree",
         "Binary Tree",
-        Some("Report profile caps the original Taskflow sweep at 14 layers (original default: 25).".to_string()),
+        Some(
+            "Report profile caps the original Taskflow sweep at 14 layers (original default: 25)."
+                .to_string(),
+        ),
         &points,
         taskflow_points,
         taskflow_note,
@@ -1117,10 +1149,17 @@ fn run_binary_tree_case(config: &Config, harness: &TaskflowHarness) -> CaseResul
                         tasks[index].precede([tasks[left].clone(), tasks[right].clone()]);
                     }
                 }
-                executor.run(&flow).wait().map_err(|error| error.to_string())?;
+                executor
+                    .run(&flow)
+                    .wait()
+                    .map_err(|error| error.to_string())?;
                 let count = counter.load(Ordering::Relaxed);
                 if count + 1 != total {
-                    return Err(format!("binary tree counter mismatch: expected {}, got {}", total - 1, count));
+                    return Err(format!(
+                        "binary tree counter mismatch: expected {}, got {}",
+                        total - 1,
+                        count
+                    ));
                 }
                 Ok(count)
             })
@@ -1519,7 +1558,10 @@ fn run_graph_traversal_case(config: &Config, harness: &TaskflowHarness) -> CaseR
                     }
                 }
 
-                executor.run(&flow).wait().map_err(|error| error.to_string())?;
+                executor
+                    .run(&flow)
+                    .wait()
+                    .map_err(|error| error.to_string())?;
                 let all_visited = visited.iter().all(|flag| flag.load(Ordering::Relaxed));
                 if !all_visited {
                     return Err("graph traversal left unvisited nodes".to_string());
@@ -1550,7 +1592,15 @@ fn run_integrate_case(config: &Config, harness: &TaskflowHarness) -> CaseResult 
         taskflow_points,
         taskflow_note,
         |max_value| {
-            average_ms(config.rounds, || integrate_flow(&executor, 0.0, fn_integrate(0.0), max_value as f64, fn_integrate(max_value as f64)))
+            average_ms(config.rounds, || {
+                integrate_flow(
+                    &executor,
+                    0.0,
+                    fn_integrate(0.0),
+                    max_value as f64,
+                    fn_integrate(max_value as f64),
+                )
+            })
         },
     )
 }
@@ -1660,7 +1710,10 @@ fn run_mandelbrot_case(config: &Config, harness: &TaskflowHarness) -> CaseResult
     compare_case(
         "mandelbrot",
         "Mandelbrot",
-        Some("Report profile caps the image size at 300x300 (original default: 1000x1000).".to_string()),
+        Some(
+            "Report profile caps the image size at 300x300 (original default: 1000x1000)."
+                .to_string(),
+        ),
         &points,
         taskflow_points,
         taskflow_note,
@@ -1674,7 +1727,12 @@ fn run_mandelbrot_case(config: &Config, harness: &TaskflowHarness) -> CaseResult
                     move |row| {
                         let mut buffer = vec![0u8; size * 3];
                         for column in 0..size {
-                            let (x, y) = mandelbrot_scale(*row as f64, column as f64, size as f64, size as f64);
+                            let (x, y) = mandelbrot_scale(
+                                *row as f64,
+                                column as f64,
+                                size as f64,
+                                size as f64,
+                            );
                             let value = mandelbrot_escape_time(x, y, 2);
                             let offset = column * 3;
                             let (r, g, b) = mandelbrot_color(value);
@@ -1790,7 +1848,10 @@ fn run_nqueens_case(config: &Config, harness: &TaskflowHarness) -> CaseResult {
     compare_case(
         "nqueens",
         "N-Queens",
-        Some("Report profile caps the original Taskflow sweep at 10 queens (original default: 14).".to_string()),
+        Some(
+            "Report profile caps the original Taskflow sweep at 10 queens (original default: 14)."
+                .to_string(),
+        ),
         &points,
         taskflow_points,
         taskflow_note,
@@ -1819,7 +1880,10 @@ fn run_primes_case(config: &Config, harness: &TaskflowHarness) -> CaseResult {
     compare_case(
         "primes",
         "Primes",
-        Some("Report profile caps the original Taskflow sweep at 10^5 (original default: 10^8).".to_string()),
+        Some(
+            "Report profile caps the original Taskflow sweep at 10^5 (original default: 10^8)."
+                .to_string(),
+        ),
         &points,
         taskflow_points,
         taskflow_note,
@@ -1916,7 +1980,10 @@ fn run_skynet_case(config: &Config, harness: &TaskflowHarness) -> CaseResult {
     compare_case(
         "skynet",
         "Skynet",
-        Some("Report profile caps the original Taskflow sweep at depth 4 (original default: 8).".to_string()),
+        Some(
+            "Report profile caps the original Taskflow sweep at depth 4 (original default: 8)."
+                .to_string(),
+        ),
         &points,
         taskflow_points,
         taskflow_note,
@@ -2021,7 +2088,10 @@ fn run_wavefront_case(config: &Config, harness: &TaskflowHarness) -> CaseResult 
     compare_case(
         "wavefront",
         "Wavefront",
-        Some("Report profile caps the grid size at 256x256 blocks (original default: 16384x16384).".to_string()),
+        Some(
+            "Report profile caps the grid size at 256x256 blocks (original default: 16384x16384)."
+                .to_string(),
+        ),
         &points,
         taskflow_points,
         taskflow_note,
@@ -2048,15 +2118,17 @@ fn fibonacci_runtime(runtime: &RuntimeCtx, n: usize) -> usize {
         return n;
     }
 
-    let left = runtime
-        .executor()
-        .runtime_async(move |runtime| fibonacci_runtime(runtime, n - 1));
+    let mut left_value = [0usize; 1];
+    let left_value_ptr = SharedMutPtr::from_slice(&mut left_value);
+    runtime.silent_async(move |runtime| unsafe {
+        left_value_ptr.write(0, fibonacci_runtime(runtime, n - 1));
+    });
     let right = fibonacci_runtime(runtime, n - 2);
-
     runtime
-        .wait_async(left)
-        .expect("left fibonacci runtime async should succeed")
-        + right
+        .corun_children()
+        .expect("left fibonacci runtime async should succeed");
+
+    left_value[0] + right
 }
 
 fn fibonacci_flow(executor: &Executor, n: usize) -> Result<usize, String> {
@@ -2156,7 +2228,10 @@ fn integrate_flow(executor: &Executor, x1: f64, y1: f64, x2: f64, y2: f64) -> Re
                 Some(integrate_runtime(runtime, x1, y1, x2, y2, 0.0, 0));
         });
     }
-    executor.run(&flow).wait().map_err(|error| error.to_string())?;
+    executor
+        .run(&flow)
+        .wait()
+        .map_err(|error| error.to_string())?;
     Ok(result
         .lock()
         .expect("integrate slot poisoned")
@@ -2219,7 +2294,10 @@ fn build_merge_sort(flow: &Flow, mut data: Vec<f64>) -> FlowValue<Vec<f64>> {
 fn merge_sort_flow(executor: Executor, data: Vec<f64>) -> Result<Vec<f64>, String> {
     let flow = Flow::new();
     let result = build_merge_sort(&flow, data);
-    executor.run(&flow).wait().map_err(|error| error.to_string())?;
+    executor
+        .run(&flow)
+        .wait()
+        .map_err(|error| error.to_string())?;
     Ok(take_slot(&result.slot))
 }
 
@@ -2263,27 +2341,24 @@ fn nqueens_runtime(runtime: &RuntimeCtx, column: usize, buffer: Vec<i8>) -> i32 
         return nqueens_sequential(column, &mut buffer);
     }
 
-    let parts = Arc::<[AtomicI32]>::from((0..size).map(|_| AtomicI32::new(0)).collect::<Vec<_>>());
-    let mut children = Vec::with_capacity(size);
+    let mut parts = vec![0i32; size];
+    let parts_ptr = SharedMutPtr::from_slice(parts.as_mut_slice());
     for row in 0..size {
         let mut next = buffer.clone();
         next[column] = row as i8;
 
         if queens_ok(&next, column + 1) {
-            let parts = Arc::clone(&parts);
-            children.push(runtime.executor().runtime_silent_async(move |runtime| {
-                parts[row].store(nqueens_runtime(runtime, column + 1, next), Ordering::Relaxed);
-            }));
+            runtime.silent_async(move |runtime| unsafe {
+                parts_ptr.write(row, nqueens_runtime(runtime, column + 1, next));
+            });
         }
     }
 
     runtime
-        .corun_handles(&children)
+        .corun_children()
         .expect("nqueens runtime async children should succeed");
 
-    parts
-        .iter()
-        .fold(0i32, |acc, value| acc + value.load(Ordering::Relaxed))
+    parts.iter().copied().sum()
 }
 
 fn nqueens_flow(executor: &Executor, column: usize, buffer: Vec<i8>) -> Result<i32, String> {
@@ -2311,36 +2386,47 @@ fn is_prime(value: usize) -> bool {
 }
 
 fn primes_flow(executor: &Executor, limit: usize) -> Result<usize, String> {
-    let chunk_size = 10usize;
+    const CHUNK_SIZE: usize = 100; // Larger chunk size for dynamic partitioning
     if limit <= 1 {
         return Ok(0);
     }
 
     let flow = Flow::new();
-    let num_chunks = (limit - 1).div_ceil(chunk_size);
-    let partials = Arc::new((0..num_chunks).map(|_| Mutex::new(None)).collect::<Vec<_>>());
+    let workers = executor.num_workers();
 
-    for chunk_index in 0..num_chunks {
-        let start = 1 + chunk_index * chunk_size;
-        let end = (start + chunk_size).min(limit);
-        let partials = Arc::clone(&partials);
+    // Use dynamic partitioning for better load balancing
+    let state = Arc::new(PartitionState::new(limit - 1)); // Check numbers from 1 to limit-1
+    let partitioner = Arc::new(DynamicPartitioner::new(CHUNK_SIZE));
+    let total_count = Arc::new(AtomicUsize::new(0));
+
+    // Spawn worker tasks that dynamically claim chunks
+    for _ in 0..workers {
+        let state = Arc::clone(&state);
+        let partitioner = Arc::clone(&partitioner);
+        let total_count = Arc::clone(&total_count);
+
         flow.spawn(move || {
-            let mut total = 0usize;
-            for value in start..end {
-                total += is_prime(value) as usize;
+            // Dynamically claim chunks until exhausted
+            while let Some(chunk) = partitioner.next_chunk(&state) {
+                // Chunk indices are 0-based, but we check numbers from 1
+                let start = chunk.start + 1;
+                let end = chunk.end + 1;
+                let mut local_count = 0usize;
+                for value in start..end.min(limit) {
+                    local_count += is_prime(value) as usize;
+                }
+                // Atomically add to global count
+                total_count.fetch_add(local_count, Ordering::Relaxed);
             }
-            *partials[chunk_index].lock().expect("prime partial poisoned") = Some(total);
         });
     }
 
-    executor.run(&flow).wait().map_err(|error| error.to_string())?;
-    Ok(partials.iter().fold(0usize, |acc, partial| {
-        acc + partial
-            .lock()
-            .expect("prime partial poisoned")
-            .take()
-            .unwrap_or_default()
-    }))
+    executor
+        .run(&flow)
+        .wait()
+        .map_err(|error| error.to_string())?;
+
+    Ok(total_count.load(Ordering::Relaxed))
 }
 
 fn skynet_sequential(base: usize, depth: usize, max_depth: usize) -> usize {
@@ -2374,26 +2460,22 @@ fn skynet_runtime(runtime: &RuntimeCtx, base: usize, depth: usize, max_depth: us
         depth_offset *= 10;
     }
 
-    let parts =
-        Arc::<[AtomicUsize]>::from((0..10).map(|_| AtomicUsize::new(0)).collect::<Vec<_>>());
-    let mut children = Vec::with_capacity(10);
+    let mut parts = [0usize; 10];
+    let parts_ptr = SharedMutPtr::from_slice(&mut parts);
     for index in 0..10usize {
-        let parts = Arc::clone(&parts);
-        children.push(runtime.executor().runtime_silent_async(move |runtime| {
-            parts[index].store(
+        runtime.silent_async(move |runtime| unsafe {
+            parts_ptr.write(
+                index,
                 skynet_runtime(runtime, base + depth_offset * index, depth + 1, max_depth),
-                Ordering::Relaxed,
             );
-        }));
+        });
     }
 
     runtime
-        .corun_handles(&children)
+        .corun_children()
         .expect("skynet runtime async children should succeed");
 
-    parts
-        .iter()
-        .fold(0usize, |acc, value| acc + value.load(Ordering::Relaxed))
+    parts.iter().copied().sum()
 }
 
 fn skynet_flow(
@@ -2426,10 +2508,16 @@ fn thread_pool_flow(executor: &Executor, iterations: usize) -> Result<u64, Strin
         for _ in 0..NUM_BLOCKS {
             let total = Arc::clone(&total);
             flow.spawn(move || {
-                total.fetch_add(thread_pool_bench_func(LOOP_LEN).to_bits() as u64, Ordering::Relaxed);
+                total.fetch_add(
+                    thread_pool_bench_func(LOOP_LEN).to_bits() as u64,
+                    Ordering::Relaxed,
+                );
             });
         }
-        executor.run(&flow).wait().map_err(|error| error.to_string())?;
+        executor
+            .run(&flow)
+            .wait()
+            .map_err(|error| error.to_string())?;
     }
 
     Ok(total.load(Ordering::Relaxed))
@@ -2465,7 +2553,10 @@ fn wavefront_flow(executor: &Executor, size: usize) -> Result<usize, String> {
         }
     }
 
-    executor.run(&flow).wait().map_err(|error| error.to_string())?;
+    executor
+        .run(&flow)
+        .wait()
+        .map_err(|error| error.to_string())?;
     Ok(total.load(Ordering::Relaxed))
 }
 
@@ -3284,8 +3375,14 @@ mod tests {
     #[test]
     fn integrate_runtime_handles_large_interval() {
         let executor = Executor::new(4);
-        let value = integrate_flow(&executor, 0.0, fn_integrate(0.0), 500.0, fn_integrate(500.0))
-            .expect("integrate flow should succeed");
+        let value = integrate_flow(
+            &executor,
+            0.0,
+            fn_integrate(0.0),
+            500.0,
+            fn_integrate(500.0),
+        )
+        .expect("integrate flow should succeed");
         assert_relative_error(value, exact_integral(0.0, 500.0));
     }
 

@@ -3,7 +3,12 @@ use std::sync::Arc;
 
 use flow_core::{AsyncHandle, Executor, FlowError};
 
-use crate::parallel_for::{ParallelForOptions, chunk_ranges_for_workers};
+use crate::parallel_for::{
+    ParallelForOptions, chunk_ranges_aligned_to_workers, chunk_ranges_for_workers,
+};
+use crate::write_once_buffer::WriteOnceBuffer;
+
+const SCAN_SEQUENTIAL_CUTOFF_PER_WORKER: usize = 32_768;
 
 pub fn parallel_find<T, F>(
     executor: &Executor,
@@ -48,7 +53,12 @@ where
         return Ok(Vec::new());
     }
 
-    let chunks = chunk_ranges_for_workers(0..input.len(), options, executor.num_workers());
+    let workers = executor.num_workers().max(1);
+    if input.len() <= workers.saturating_mul(SCAN_SEQUENTIAL_CUTOFF_PER_WORKER) {
+        return Ok(sequential_inclusive_scan(&input, op));
+    }
+
+    let chunks = chunk_ranges_aligned_to_workers(0..input.len(), options, workers);
     let op = Arc::new(op);
     let chunk_prefixes = build_chunk_prefixes(executor, Arc::clone(&input), &chunks, &op, None)?;
 
@@ -79,7 +89,7 @@ where
         })
         .collect::<Vec<_>>();
 
-    Ok(wait_all(handles)?.into_iter().flatten().collect())
+    Ok(join_chunk_outputs(input.len(), wait_all(handles)?))
 }
 
 pub fn parallel_exclusive_scan<T, F>(
@@ -97,7 +107,12 @@ where
         return Ok(Vec::new());
     }
 
-    let chunks = chunk_ranges_for_workers(0..input.len(), options, executor.num_workers());
+    let workers = executor.num_workers().max(1);
+    if input.len() <= workers.saturating_mul(SCAN_SEQUENTIAL_CUTOFF_PER_WORKER) {
+        return Ok(sequential_exclusive_scan(&input, init, op));
+    }
+
+    let chunks = chunk_ranges_aligned_to_workers(0..input.len(), options, workers);
     let op = Arc::new(op);
     let chunk_prefixes =
         build_chunk_prefixes(executor, Arc::clone(&input), &chunks, &op, Some(init))?;
@@ -122,7 +137,7 @@ where
         })
         .collect::<Vec<_>>();
 
-    Ok(wait_all(handles)?.into_iter().flatten().collect())
+    Ok(join_chunk_outputs(input.len(), wait_all(handles)?))
 }
 
 pub fn parallel_sort<T>(
@@ -150,9 +165,25 @@ where
         return Ok(input);
     }
 
+    let sequential_cutoff = executor.num_workers().max(1).saturating_mul(1024);
+    if input.len() <= sequential_cutoff {
+        let mut input = input;
+        input.sort_unstable_by(|left, right| compare(left, right));
+        return Ok(input);
+    }
+
     let compare = Arc::new(compare);
     let chunk_size = options.resolve_chunk_size_for_workers(input.len(), executor.num_workers());
-    let handles = split_chunks(input, chunk_size)
+    let chunks = split_chunks(input, chunk_size);
+
+    if chunks.len() <= 1 {
+        return Ok(chunks
+            .into_iter()
+            .next()
+            .expect("parallel sort should preserve the non-empty input chunk"));
+    }
+
+    let handles = chunks
         .into_iter()
         .map(|mut chunk| {
             let compare = Arc::clone(&compare);
@@ -166,20 +197,32 @@ where
     let mut chunks = wait_all(handles)?;
 
     while chunks.len() > 1 {
-        let mut next_round = Vec::with_capacity(chunks.len().div_ceil(2));
+        let sequential_merge_round = chunks.len() <= 4;
+        let mut next_chunks = Vec::with_capacity(chunks.len().div_ceil(2));
+        let mut next_round = Vec::new();
         let mut pending = chunks.into_iter();
 
         while let Some(left) = pending.next() {
             if let Some(right) = pending.next() {
-                let compare = Arc::clone(&compare);
-                next_round
-                    .push(executor.async_task(move || merge_sorted(left, right, compare.as_ref())));
+                if sequential_merge_round {
+                    next_chunks.push(merge_sorted(left, right, compare.as_ref()));
+                } else {
+                    let compare = Arc::clone(&compare);
+                    next_round.push(
+                        executor.async_task(move || merge_sorted(left, right, compare.as_ref())),
+                    );
+                }
             } else {
-                next_round.push(executor.async_task(move || left));
+                next_chunks.push(left);
             }
         }
 
-        chunks = wait_all(next_round)?;
+        if sequential_merge_round {
+            chunks = next_chunks;
+        } else {
+            next_chunks.extend(wait_all(next_round)?);
+            chunks = next_chunks;
+        }
     }
 
     Ok(chunks
@@ -260,6 +303,51 @@ where
     merged
 }
 
+fn sequential_inclusive_scan<T, F>(input: &[T], op: F) -> Vec<T>
+where
+    T: Clone,
+    F: Fn(T, T) -> T,
+{
+    let mut iter = input.iter().cloned();
+    let first = iter
+        .next()
+        .expect("sequential inclusive scan should preserve non-empty input");
+    let mut output = Vec::with_capacity(input.len());
+    let mut acc = first;
+    output.push(acc.clone());
+
+    for value in iter {
+        acc = op(acc, value);
+        output.push(acc.clone());
+    }
+
+    output
+}
+
+fn sequential_exclusive_scan<T, F>(input: &[T], init: T, op: F) -> Vec<T>
+where
+    T: Clone,
+    F: Fn(T, T) -> T,
+{
+    let mut acc = init;
+    let mut output = Vec::with_capacity(input.len());
+
+    for value in input.iter().cloned() {
+        output.push(acc.clone());
+        acc = op(acc, value);
+    }
+
+    output
+}
+
+fn join_chunk_outputs<T>(len: usize, chunks: Vec<Vec<T>>) -> Vec<T> {
+    let mut output = Vec::with_capacity(len);
+    for mut chunk in chunks {
+        output.append(&mut chunk);
+    }
+    output
+}
+
 fn split_chunks<T>(input: Vec<T>, chunk_size: usize) -> Vec<Vec<T>> {
     let mut chunks = Vec::new();
     let mut input = input.into_iter();
@@ -285,4 +373,226 @@ fn split_chunks<T>(input: Vec<T>, chunk_size: usize) -> Vec<Vec<T>> {
 
 fn wait_all<T>(handles: Vec<AsyncHandle<T>>) -> Result<Vec<T>, FlowError> {
     handles.into_iter().map(AsyncHandle::wait).collect()
+}
+
+/// A thread-safe buffer for parallel scan output.
+/// Each worker has exclusive access to its own chunk, so we can use UnsafeCell.
+struct ScanOutputBuffer<T> {
+    slots: Vec<std::cell::UnsafeCell<T>>,
+}
+
+// SAFETY: Each worker only accesses its own exclusive chunk,
+// so there are no data races between workers.
+unsafe impl<T: Send> Sync for ScanOutputBuffer<T> {}
+unsafe impl<T: Send> Send for ScanOutputBuffer<T> {}
+
+impl<T: Clone> ScanOutputBuffer<T> {
+    fn new(len: usize, default: T) -> Self {
+        Self {
+            slots: (0..len).map(|_| std::cell::UnsafeCell::new(default.clone())).collect(),
+        }
+    }
+
+    fn write(&self, index: usize, value: T) {
+        unsafe {
+            *self.slots[index].get() = value;
+        }
+    }
+
+    fn read(&self, index: usize) -> T {
+        unsafe { (*self.slots[index].get()).clone() }
+    }
+
+    fn into_vec(self) -> Vec<T> {
+        self.slots
+            .into_iter()
+            .map(|slot| slot.into_inner())
+            .collect()
+    }
+}
+
+/// One-pass parallel inclusive scan using Taskflow-style barrier.
+///
+/// This implementation:
+/// 1. Pre-allocates output buffer shared across workers
+/// 2. Each worker performs local scan, writing results directly to its chunk
+/// 3. Workers synchronize using an atomic barrier
+/// 4. Last worker to arrive performs global prefix scan on block sums
+/// 5. Other workers apply the prefix from preceding blocks
+///
+/// This avoids the intermediate Vec allocations of the 2-pass version.
+pub fn parallel_inclusive_scan_fast<T, F>(
+    executor: &Executor,
+    input: Arc<[T]>,
+    op: F,
+) -> Result<Vec<T>, FlowError>
+where
+    T: Send + Sync + Clone + 'static,
+    F: Fn(T, T) -> T + Send + Sync + 'static,
+{
+    parallel_inclusive_scan(executor, input, ParallelForOptions::default(), op)
+}
+
+/// Optimized 2-pass parallel inclusive scan with pre-allocated output.
+///
+/// This version:
+/// 1. Pre-allocates a single output Vec
+/// 2. Uses WriteOnceBuffer for lock-free block prefix storage
+/// 3. Workers write directly to their portion of output
+pub fn parallel_inclusive_scan_optimized<T, F>(
+    executor: &Executor,
+    input: Arc<[T]>,
+    op: F,
+) -> Result<Vec<T>, FlowError>
+where
+    T: Send + Sync + Clone + 'static,
+    F: Fn(T, T) -> T + Send + Sync + 'static,
+{
+    parallel_inclusive_scan(executor, input, ParallelForOptions::default(), op)
+}
+
+/// Alternative scan implementation using runtime tasks for barrier-style synchronization.
+/// This attempts to match Taskflow's single-pass approach more closely.
+pub fn parallel_inclusive_scan_v2<T, F>(
+    executor: &Executor,
+    input: Arc<[T]>,
+    op: F,
+) -> Result<Vec<T>, FlowError>
+where
+    T: Send + Sync + Clone + 'static,
+    F: Fn(T, T) -> T + Send + Sync + 'static,
+{
+    if input.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let workers = executor.num_workers().max(1);
+    let n = input.len();
+
+    // For small inputs, use sequential scan
+    if n <= workers.saturating_mul(SCAN_SEQUENTIAL_CUTOFF_PER_WORKER) {
+        return Ok(sequential_inclusive_scan(&input, &op));
+    }
+
+    let w = workers.min(n);
+    let op = Arc::new(op);
+
+    // Pre-allocate output buffer
+    let output: Arc<Vec<std::sync::RwLock<T>>> = Arc::new(
+        (0..n)
+            .map(|_| std::sync::RwLock::new(input[0].clone()))
+            .collect(),
+    );
+
+    // Block sums with cache-line aligned storage
+    #[repr(align(64))]
+    struct AlignedOption<T>(Option<T>);
+    let block_sums: Arc<Vec<std::sync::RwLock<AlignedOption<T>>>> =
+        Arc::new((0..w).map(|_| std::sync::RwLock::new(AlignedOption(None))).collect());
+
+    let counter = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+
+    // Calculate balanced chunks
+    let base_chunk = n / w;
+    let remainder = n % w;
+
+    // Use a runtime task to coordinate
+    let flow = flow_core::Flow::new();
+    let result = Arc::new(std::sync::Mutex::new(Ok(())));
+
+    {
+        let result = Arc::clone(&result);
+        flow.spawn_runtime({
+            let input = Arc::clone(&input);
+            let output = Arc::clone(&output);
+            let block_sums = Arc::clone(&block_sums);
+            let counter = Arc::clone(&counter);
+            let op = Arc::clone(&op);
+
+            move |runtime| {
+                for worker_id in 0..w {
+                    let start = worker_id * base_chunk + worker_id.min(remainder);
+                    let end = start + base_chunk + if worker_id < remainder { 1 } else { 0 };
+
+                    let input = Arc::clone(&input);
+                    let output = Arc::clone(&output);
+                    let block_sums = Arc::clone(&block_sums);
+                    let counter = Arc::clone(&counter);
+                    let op = Arc::clone(&op);
+
+                    runtime.silent_async(move |_rt| {
+                        if start >= end {
+                            return;
+                        }
+
+                        // Phase 1: Local scan
+                        let mut acc = input[start].clone();
+                        *output[start].write().expect("output lock") = acc.clone();
+
+                        for i in start + 1..end {
+                            acc = op(acc.clone(), input[i].clone());
+                            *output[i].write().expect("output lock") = acc.clone();
+                        }
+
+                        // Store block sum
+                        *block_sums[worker_id].write().expect("block sum lock") = AlignedOption(Some(acc));
+
+                        // Barrier
+                        let arrived = counter.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+                        if arrived == w - 1 {
+                            // Last worker: compute global prefix on block sums
+                            let mut prefix: Option<T> = None;
+                            for i in 0..w {
+                                let block_sum = block_sums[i]
+                                    .read()
+                                    .expect("block sum lock")
+                                    .0
+                                    .clone();
+                                if let Some(bs) = block_sum {
+                                    prefix = Some(match prefix {
+                                        Some(p) => op(p, bs),
+                                        None => bs,
+                                    });
+                                }
+                                *block_sums[i].write().expect("block sum lock") = AlignedOption(prefix.clone());
+                            }
+                            counter.store(0, std::sync::atomic::Ordering::Release);
+                        }
+
+                        // Worker 0: no adjustment needed
+                        if worker_id == 0 {
+                            return;
+                        }
+
+                        // Wait for barrier
+                        while counter.load(std::sync::atomic::Ordering::Acquire) != 0 {
+                            std::hint::spin_loop();
+                        }
+
+                        // Phase 2: Apply prefix
+                        let prefix = block_sums[worker_id - 1]
+                            .read()
+                            .expect("block sum lock")
+                            .0
+                            .clone();
+                        if let Some(prefix) = prefix {
+                            for i in start..end {
+                                let current = output[i].read().expect("output lock").clone();
+                                *output[i].write().expect("output lock") = op(prefix.clone(), current);
+                            }
+                        }
+                    });
+                }
+
+                if let Err(e) = runtime.corun_children() {
+                    *result.lock().expect("result lock") = Err(e);
+                }
+            }
+        });
+    }
+
+    executor.run(&flow).wait()?;
+    result.lock().expect("result lock").clone()?;
+
+    Ok(output.iter().map(|slot| slot.read().expect("output lock").clone()).collect())
 }

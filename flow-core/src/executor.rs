@@ -2,7 +2,7 @@ use std::any::Any;
 use std::cell::RefCell;
 use std::collections::VecDeque;
 use std::panic::{self, AssertUnwindSafe};
-use std::sync::atomic::{fence, AtomicBool, AtomicU32, AtomicU8, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU32, AtomicUsize, Ordering, fence};
 use std::sync::{Arc, Condvar, Mutex, OnceLock, RwLock};
 use std::thread::{self, JoinHandle};
 
@@ -499,6 +499,8 @@ impl Executor {
         F: FnMut() -> bool,
     {
         let mut continuation = None;
+        let mut steal_attempts = 0usize;
+        const MAX_STEAL_ATTEMPTS: usize = 64;
 
         loop {
             if done() {
@@ -509,6 +511,7 @@ impl Executor {
                 .take()
                 .or_else(|| self.inner.next_task(worker_id));
             if let Some(task) = task {
+                steal_attempts = 0;
                 continuation = self.inner.execute(self, worker_id, task);
                 continue;
             }
@@ -532,7 +535,19 @@ impl Executor {
                     self.inner
                         .commit_park(worker_id, observed_epoch, &self.inner.shutdown);
                 }
-                DriveMode::NoPark => thread::yield_now(),
+                DriveMode::NoPark => {
+                    // Aggressive work-stealing: try multiple times before yielding
+                    // This matches Taskflow's _corun_until behavior
+                    steal_attempts += 1;
+                    if steal_attempts < MAX_STEAL_ATTEMPTS {
+                        // Spin and try to steal again
+                        std::hint::spin_loop();
+                    } else {
+                        // Reset counter and yield to allow other threads to run
+                        steal_attempts = 0;
+                        thread::yield_now();
+                    }
+                }
             }
         }
     }
@@ -705,12 +720,16 @@ impl ExecutorInner {
     fn commit_park(&self, worker_id: usize, observed_epoch: u64, shutdown: &AtomicBool) {
         let parker = &self.parkers[worker_id];
         let observed_epoch = observed_epoch as u32;
+        let current_epoch = parker.epoch.load(Ordering::Relaxed);
 
         if parker.state.load(Ordering::Relaxed) != WORKER_PREPARING
-            || parker.epoch.load(Ordering::Relaxed) != observed_epoch
+            || current_epoch != observed_epoch
             || shutdown.load(Ordering::Acquire)
         {
             parker.state.store(WORKER_RUNNING, Ordering::Relaxed);
+            if current_epoch != observed_epoch && !shutdown.load(Ordering::Acquire) {
+                self.notify_worker_wake(worker_id);
+            }
             return;
         }
 
