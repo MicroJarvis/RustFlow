@@ -6,6 +6,8 @@ use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU32, AtomicUsize, Ordering, 
 use std::sync::{Arc, Condvar, Mutex, OnceLock, RwLock};
 use std::thread::{self, JoinHandle};
 
+use crossbeam_deque::{Injector, Steal, Stealer, Worker};
+
 use crate::async_handle::{AsyncHandle, AsyncState, RuntimeAsyncState};
 use crate::error::FlowError;
 use crate::flow::{Flow, GraphSnapshot, NodeSnapshot, Subflow, TaskId, TaskKind};
@@ -169,19 +171,26 @@ impl Executor {
     pub fn new(worker_count: usize) -> Self {
         assert!(worker_count > 0, "executor must have at least one worker");
 
-        let workers = (0..worker_count)
-            .map(|_| Arc::new(WorkerQueue::default()))
-            .collect();
+        // Pre-create worker queues and stealers
+        let (workers, stealers): (Vec<_>, Vec<_>) = (0..worker_count)
+            .map(|_| {
+                let worker = Worker::new_lifo();
+                let stealer = worker.stealer();
+                (worker, stealer)
+            })
+            .unzip();
+
         let parkers = (0..worker_count)
             .map(|_| Arc::new(WorkerParker::default()))
             .collect();
 
         let inner = Arc::new(ExecutorInner {
-            workers,
+            stealers: stealers.into(),
+            injector: Injector::new(),
+            workers: Mutex::new(Some(workers)),
             parkers,
             run_completion: RunCompletionEvent::default(),
             worker_count,
-            next_worker: AtomicUsize::new(0),
             active_runs: AtomicUsize::new(0),
             shutdown: AtomicBool::new(false),
             threads: Mutex::new(Vec::with_capacity(worker_count)),
@@ -575,38 +584,6 @@ impl Drop for Executor {
 }
 
 #[derive(Default)]
-struct WorkerQueue {
-    tasks: Mutex<VecDeque<ScheduledWork>>,
-}
-
-impl WorkerQueue {
-    fn push_back(&self, task: ScheduledWork) -> bool {
-        let mut tasks = self.tasks.lock().expect("worker queue poisoned");
-        let was_empty = tasks.is_empty();
-        tasks.push_back(task);
-        was_empty
-    }
-
-    fn push_back_many(&self, tasks_to_push: Vec<ScheduledWork>) -> bool {
-        let mut tasks = self.tasks.lock().expect("worker queue poisoned");
-        let was_empty = tasks.is_empty();
-        tasks.extend(tasks_to_push);
-        was_empty
-    }
-
-    fn pop_back(&self) -> Option<ScheduledWork> {
-        self.tasks.lock().expect("worker queue poisoned").pop_back()
-    }
-
-    fn steal_front(&self) -> Option<ScheduledWork> {
-        self.tasks
-            .lock()
-            .expect("worker queue poisoned")
-            .pop_front()
-    }
-}
-
-#[derive(Default)]
 struct WorkerParker {
     state: AtomicU8,
     epoch: AtomicU32,
@@ -642,12 +619,44 @@ impl RunCompletionEvent {
     }
 }
 
+/// Per-worker local state stored in thread-local storage.
+/// This allows enqueue operations from within a worker to push directly to its local queue.
+thread_local! {
+    static WORKER_LOCAL: RefCell<Option<WorkerLocalState>> = RefCell::new(None);
+}
+
+struct WorkerLocalState {
+    worker: Worker<ScheduledWork>,
+    worker_id: usize,
+}
+
+struct WorkerLocalGuard;
+
+impl Drop for WorkerLocalGuard {
+    fn drop(&mut self) {
+        WORKER_LOCAL.with(|slot| {
+            *slot.borrow_mut() = None;
+        });
+    }
+}
+
+fn install_worker_local(worker: Worker<ScheduledWork>, worker_id: usize) -> WorkerLocalGuard {
+    WORKER_LOCAL.with(|slot| {
+        *slot.borrow_mut() = Some(WorkerLocalState { worker, worker_id });
+    });
+    WorkerLocalGuard
+}
+
 struct ExecutorInner {
-    workers: Vec<Arc<WorkerQueue>>,
+    /// Stealers for each worker - used for work stealing between workers
+    stealers: Arc<[Stealer<ScheduledWork>]>,
+    /// Global injector for tasks submitted from external threads
+    injector: Injector<ScheduledWork>,
+    /// Workers - passed to worker threads during startup
+    workers: Mutex<Option<Vec<Worker<ScheduledWork>>>>,
     parkers: Vec<Arc<WorkerParker>>,
     run_completion: RunCompletionEvent,
     worker_count: usize,
-    next_worker: AtomicUsize,
     active_runs: AtomicUsize,
     shutdown: AtomicBool,
     threads: Mutex<Vec<JoinHandle<()>>>,
@@ -806,18 +815,36 @@ impl ExecutorInner {
     }
 
     fn enqueue(&self, task: ScheduledWork, worker_hint: Option<usize>) {
-        let worker_id = worker_hint.unwrap_or_else(|| {
-            self.next_worker.fetch_add(1, Ordering::Relaxed) % self.worker_count
+        // Use a cell to track whether we pushed locally
+        let mut task_opt = Some(task);
+
+        WORKER_LOCAL.with(|slot| {
+            let borrowed = slot.borrow();
+            if let Some(local) = borrowed.as_ref() {
+                // We're in a worker thread - push to local queue
+                // But respect worker_hint if it's different from our worker_id
+                if worker_hint.is_none() || worker_hint == Some(local.worker_id) {
+                    if let Some(t) = task_opt.take() {
+                        local.worker.push(t);
+                    }
+                }
+            }
         });
-        let queue_was_empty = self.workers[worker_id].push_back(task);
-        if !queue_was_empty {
-            return;
-        }
-        fence(Ordering::SeqCst);
-        if !self.wake_worker(worker_id) {
-            for parked_worker in 0..self.parkers.len() {
-                if parked_worker != worker_id && self.wake_worker(parked_worker) {
-                    break;
+
+        // If not pushed locally, push to injector
+        if let Some(task) = task_opt {
+            self.injector.push(task);
+            fence(Ordering::SeqCst);
+
+            // Wake a worker to process the task
+            if let Some(target) = worker_hint {
+                let _ = self.wake_worker(target);
+            } else {
+                // Wake any parked worker
+                for worker_id in 0..self.parkers.len() {
+                    if self.wake_worker(worker_id) {
+                        break;
+                    }
                 }
             }
         }
@@ -828,49 +855,36 @@ impl ExecutorInner {
             return;
         }
 
-        if let Some(worker_id) = worker_hint {
-            let queue_was_empty = self.workers[worker_id].push_back_many(tasks);
-            if !queue_was_empty {
-                return;
-            }
-            fence(Ordering::SeqCst);
-            if !self.wake_worker(worker_id) {
-                for parked_worker in 0..self.parkers.len() {
-                    if parked_worker != worker_id && self.wake_worker(parked_worker) {
-                        break;
+        let mut tasks_opt = Some(tasks);
+
+        WORKER_LOCAL.with(|slot| {
+            let borrowed = slot.borrow();
+            if let Some(local) = borrowed.as_ref() {
+                if worker_hint.is_none() || worker_hint == Some(local.worker_id) {
+                    if let Some(t) = tasks_opt.take() {
+                        for task in t {
+                            local.worker.push(task);
+                        }
                     }
                 }
             }
-            return;
-        }
+        });
 
-        let start_worker = self.next_worker.fetch_add(tasks.len(), Ordering::Relaxed);
-        let mut per_worker = (0..self.worker_count)
-            .map(|_| Vec::new())
-            .collect::<Vec<Vec<ScheduledWork>>>();
-
-        for (offset, task) in tasks.into_iter().enumerate() {
-            let worker_id = (start_worker + offset) % self.worker_count;
-            per_worker[worker_id].push(task);
-        }
-
-        let mut activated_workers = Vec::new();
-        for (worker_id, bucket) in per_worker.into_iter().enumerate() {
-            if bucket.is_empty() {
-                continue;
+        // If not pushed locally, push to injector
+        if let Some(tasks) = tasks_opt {
+            for task in tasks {
+                self.injector.push(task);
             }
-            if self.workers[worker_id].push_back_many(bucket) {
-                activated_workers.push(worker_id);
+            fence(Ordering::SeqCst);
+
+            // Wake workers
+            if let Some(target) = worker_hint {
+                let _ = self.wake_worker(target);
+            } else {
+                for worker_id in 0..self.parkers.len() {
+                    let _ = self.wake_worker(worker_id);
+                }
             }
-        }
-
-        if activated_workers.is_empty() {
-            return;
-        }
-
-        fence(Ordering::SeqCst);
-        for worker_id in activated_workers {
-            let _ = self.wake_worker(worker_id);
         }
     }
 
@@ -884,22 +898,63 @@ impl ExecutorInner {
         );
     }
 
+    /// Find a task using the work-stealing pattern:
+    /// 1. Pop from local worker queue (LIFO for cache locality)
+    /// 2. Steal from global injector (FIFO)
+    /// 3. Steal from other workers' queues
     fn next_task(&self, worker_id: usize) -> Option<ScheduledWork> {
-        if let Some(task) = self.workers[worker_id].pop_back() {
-            return Some(task);
-        }
+        // Access local worker from thread-local
+        WORKER_LOCAL.with(|slot| {
+            let borrowed = slot.borrow();
+            let worker = borrowed.as_ref().map(|local| &local.worker);
 
-        for offset in 1..=self.worker_count {
-            let victim = (worker_id + offset) % self.worker_count;
-            if victim == worker_id {
-                continue;
-            }
-            if let Some(task) = self.workers[victim].steal_front() {
-                return Some(task);
-            }
-        }
+            // 1. Try local queue first
+            if let Some(w) = worker {
+                if let Some(task) = w.pop() {
+                    return Some(task);
+                }
 
-        None
+                // 2. Try stealing from injector
+                match self.injector.steal_batch_and_pop(w) {
+                    Steal::Success(task) => return Some(task),
+                    Steal::Retry => {}
+                    Steal::Empty => {}
+                }
+            } else {
+                // No local worker, try injector directly
+                loop {
+                    match self.injector.steal() {
+                        Steal::Success(task) => return Some(task),
+                        Steal::Retry => continue,
+                        Steal::Empty => break,
+                    }
+                }
+            }
+
+            // 3. Try stealing from other workers (lock-free via Arc)
+            let stealers = &self.stealers;
+            let num_stealers = stealers.len();
+            if num_stealers == 0 {
+                return None;
+            }
+
+            // Start from a random position to avoid all workers targeting the same victim
+            let start = (worker_id + 1) % num_stealers;
+
+            for offset in 0..num_stealers {
+                let victim = (start + offset) % num_stealers;
+                if victim == worker_id {
+                    continue;
+                }
+                match stealers[victim].steal() {
+                    Steal::Success(task) => return Some(task),
+                    Steal::Retry => continue,
+                    Steal::Empty => continue,
+                }
+            }
+
+            None
+        })
     }
 
     fn execute(
@@ -1241,6 +1296,23 @@ impl RunState {
 }
 
 fn worker_loop(worker_id: usize, inner: Arc<ExecutorInner>) {
+    // Get our pre-created worker from the shared state
+    let worker = {
+        let mut workers = inner.workers.lock().expect("workers poisoned");
+        if let Some(ref mut w) = *workers {
+            if worker_id < w.len() {
+                w.swap_remove(worker_id)
+            } else {
+                Worker::new_lifo()
+            }
+        } else {
+            Worker::new_lifo()
+        }
+    };
+
+    // Install worker in thread-local for enqueue operations
+    let _guard = install_worker_local(worker, worker_id);
+
     inner.register_worker_thread(worker_id);
     let executor = Executor {
         inner: Arc::clone(&inner),

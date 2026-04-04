@@ -6,3 +6,6 @@ edition = "2024"
 [lib]
 name = "flow_core"
 path = "src/lib.rs"
+
+[dependencies]
+crossbeam-deque = "0.8"
