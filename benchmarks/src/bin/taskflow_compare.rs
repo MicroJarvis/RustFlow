@@ -6,15 +6,15 @@ use std::hint::black_box;
 use std::os::raw::{c_int, c_uint};
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU64, AtomicUsize, Ordering};
 use std::thread;
 use std::time::{Duration, Instant};
 
 use flow_algorithms::{
     DataPipeline, DynamicPartitioner, Executor, Flow, ParallelForExt, ParallelForOptions,
-    Partitioner, PartitionState, Pipe, PipeType, Pipeline,
-    parallel_inclusive_scan, parallel_reduce, parallel_sort,
+    PartitionState, Partitioner, Pipe, PipeType, Pipeline, parallel_inclusive_scan,
+    parallel_reduce, parallel_sort,
 };
 
 unsafe extern "C" {
@@ -532,9 +532,12 @@ fn cpp_string_literal(path: &Path) -> String {
 
 fn driver_prelude() -> &'static str {
     r#"#include <cstdlib>
+#include <cstdint>
+#include <chrono>
 #include <iostream>
 #include <stdexcept>
 #include <string>
+#include <vector>
 
 static size_t parse_size(const char* value) {
   return static_cast<size_t>(std::stoull(value));
@@ -800,6 +803,27 @@ fn c_rand_reset(seed: u32) {
 
 fn c_rand_value() -> i32 {
     unsafe { rand() as i32 }
+}
+
+fn refill_sort_input_i32(input: &mut [i32]) {
+    for value in input {
+        *value = c_rand_value();
+    }
+}
+
+fn run_sort_round(executor: &Executor, input: &mut Vec<i32>) -> Result<f64, String> {
+    refill_sort_input_i32(input);
+    let round_input = std::mem::take(input);
+
+    // Keep random input generation outside the timed section for parity with Taskflow.
+    let start = Instant::now();
+    let output = parallel_sort(executor, round_input, ParallelForOptions::default())
+        .map_err(|error| error.to_string())?;
+    let elapsed_ms = start.elapsed().as_secs_f64() * 1_000.0;
+
+    black_box(checksum_i32(&output));
+    *input = output;
+    Ok(elapsed_ms)
 }
 
 fn bench_dummy(index: usize) -> f64 {
@@ -1800,7 +1824,11 @@ fn run_matrix_multiplication_case(config: &Config, harness: &TaskflowHarness) ->
         &points,
         taskflow_points,
         taskflow_note,
-        |size| average_ms(config.rounds, || matrix_multiplication_flow(&executor, size)),
+        |size| {
+            average_ms(config.rounds, || {
+                matrix_multiplication_flow(&executor, size)
+            })
+        },
     )
 }
 
@@ -2018,31 +2046,16 @@ fn run_sort_case(config: &Config, harness: &TaskflowHarness) -> CaseResult {
     compare_case(
         "sort",
         "Sort",
-        Some("Report profile caps the original Taskflow sweep at 10^5 elements (original default: 10^8).".to_string()),
+        Some(
+            "Report profile caps the original Taskflow sweep at 10^5 elements (original default: 10^8). Taskflow driver is adapted to i32 input for apples-to-apples comparison."
+                .to_string(),
+        ),
         &points,
         taskflow_points,
         taskflow_note,
         |size| {
             let mut input = vec![0i32; size];
-
-            average_reported_ms(config.rounds, || {
-                for value in &mut input {
-                    *value = c_rand_value();
-                }
-                let round_input = input.clone();
-
-                let start = Instant::now();
-                let output = parallel_sort(
-                    &executor,
-                    round_input,
-                    ParallelForOptions::default(),
-                )
-                .map_err(|error| error.to_string())?;
-                let elapsed_ms = start.elapsed().as_secs_f64() * 1_000.0;
-
-                black_box(checksum_i32(&output));
-                Ok(elapsed_ms)
-            })
+            average_reported_ms(config.rounds, || run_sort_round(&executor, &mut input))
         },
     )
 }
@@ -2477,7 +2490,12 @@ fn skynet_task_group(executor: Executor, base: usize, depth: usize, max_depth: u
         tg.silent_async(move || unsafe {
             parts_ptr.write(
                 index,
-                skynet_task_group(child_executor, base + depth_offset * index, depth + 1, max_depth),
+                skynet_task_group(
+                    child_executor,
+                    base + depth_offset * index,
+                    depth + 1,
+                    max_depth,
+                ),
             );
         });
     }
@@ -3236,10 +3254,32 @@ int main(int argc, char** argv) {
 fn driver_sort(harness: &TaskflowHarness) -> String {
     let mut source = String::new();
     source.push_str(driver_prelude());
-    let include = harness.benchmark_cpp("sort/taskflow.cpp");
-    let _ = writeln!(source, "#include {}", cpp_string_literal(&include));
+    let taskflow_header = harness.taskflow_root.join("taskflow/taskflow.hpp");
+    let taskflow_sort_header = harness.taskflow_root.join("taskflow/algorithm/sort.hpp");
+    let _ = writeln!(source, "#include {}", cpp_string_literal(&taskflow_header));
+    let _ = writeln!(
+        source,
+        "#include {}",
+        cpp_string_literal(&taskflow_sort_header)
+    );
     source.push_str(
         r#"
+static std::vector<std::int32_t> vec;
+
+static void sort_taskflow(tf::Executor& executor) {
+  tf::Taskflow taskflow;
+  taskflow.sort(vec.begin(), vec.end());
+  executor.run(taskflow).get();
+}
+
+static std::chrono::microseconds measure_time_taskflow(size_t num_threads) {
+  static tf::Executor executor(num_threads);
+  auto beg = std::chrono::high_resolution_clock::now();
+  sort_taskflow(executor);
+  auto end = std::chrono::high_resolution_clock::now();
+  return std::chrono::duration_cast<std::chrono::microseconds>(end - beg);
+}
+
 int main(int argc, char** argv) {
   if(argc < 4) {
     throw std::runtime_error("usage: sort <threads> <rounds> <sizes...>");
