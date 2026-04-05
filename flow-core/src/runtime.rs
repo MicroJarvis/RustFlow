@@ -49,6 +49,10 @@ impl RuntimeJoinScope {
         self.pending_children.load(Ordering::Acquire) == 0
     }
 
+    pub(crate) fn pending_children(&self) -> usize {
+        self.pending_children.load(Ordering::Acquire)
+    }
+
     /// Check if any child task failed and return an error if so.
     ///
     /// Returns a generic error message since we don't store the actual error.
@@ -130,7 +134,7 @@ impl RuntimeCtx {
                 task(runtime);
                 Ok(())
             }),
-            self.worker_id,
+            Some(self.worker_id),
             Arc::clone(&self.cancelled),
             Arc::clone(&self.join_scope),
         );
@@ -142,7 +146,7 @@ impl RuntimeCtx {
     {
         self.executor.schedule_runtime_silent_child(
             Box::new(task),
-            self.worker_id,
+            Some(self.worker_id),
             Arc::clone(&self.cancelled),
             Arc::clone(&self.join_scope),
         );
@@ -153,6 +157,14 @@ impl RuntimeCtx {
             .wait_until_inline(self.worker_id, || self.join_scope.is_idle());
 
         self.join_scope.take_error().map_or(Ok(()), Err)
+    }
+
+    /// Cooperatively drive local work until the predicate becomes true.
+    pub fn corun_until<P>(&self, mut predicate: P)
+    where
+        P: FnMut() -> bool,
+    {
+        self.executor.wait_until_inline(self.worker_id, || predicate());
     }
 
     pub fn wait_async<T>(&self, handle: AsyncHandle<T>) -> Result<T, FlowError> {
@@ -192,6 +204,6 @@ impl RuntimeCtx {
     /// tg.corun()?; // Wait for both tasks
     /// ```
     pub fn task_group(&self) -> TaskGroup {
-        TaskGroup::new(self.executor.clone(), self.worker_id)
+        self.executor.task_group()
     }
 }

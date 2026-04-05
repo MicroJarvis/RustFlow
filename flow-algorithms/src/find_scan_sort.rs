@@ -1,15 +1,16 @@
+use std::cell::UnsafeCell;
 use std::cmp::Ordering;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
-use std::cell::UnsafeCell;
 
-use flow_core::{AsyncHandle, Executor, Flow, FlowError};
+use flow_core::{AsyncHandle, Executor, FlowError};
 
 use crate::parallel_for::{
     ParallelForOptions, chunk_ranges_for_workers,
 };
 
-const SCAN_SEQUENTIAL_CUTOFF_PER_WORKER: usize = 32_768;
+const SCAN_SEQUENTIAL_CUTOFF_PER_WORKER: usize = 2_048;
+const SORT_SEQUENTIAL_CUTOFF_PER_WORKER: usize = 2_048;
 
 /// Thread-safe wrapper for UnsafeCell buffer where each worker has exclusive access to its chunk.
 struct ScanBuffer<T> {
@@ -26,13 +27,15 @@ impl<T> ScanBuffer<T> {
     }
 
     unsafe fn write(&self, index: usize, value: T) {
-        *self.data[index].get() = value;
+        unsafe {
+            *self.data[index].get() = value;
+        }
     }
 
     unsafe fn read(&self, index: usize) -> T
     where T: Clone
     {
-        (*self.data[index].get()).clone()
+        unsafe { (*self.data[index].get()).clone() }
     }
 
     fn into_inner(self) -> Vec<T> {
@@ -44,6 +47,25 @@ impl<T> ScanBuffer<T> {
 // Workers never access the same indices, so there are no data races.
 unsafe impl<T: Send> Send for ScanBuffer<T> {}
 unsafe impl<T: Send> Sync for ScanBuffer<T> {}
+
+struct SharedMutPtr<T>(*mut T);
+
+impl<T> Clone for SharedMutPtr<T> {
+    fn clone(&self) -> Self {
+        *self
+    }
+}
+
+impl<T> Copy for SharedMutPtr<T> {}
+
+unsafe impl<T: Send> Send for SharedMutPtr<T> {}
+unsafe impl<T: Send> Sync for SharedMutPtr<T> {}
+
+impl<T> SharedMutPtr<T> {
+    fn from_slice(values: &mut [T]) -> Self {
+        Self(values.as_mut_ptr())
+    }
+}
 
 pub fn parallel_find<T, F>(
     executor: &Executor,
@@ -118,74 +140,58 @@ where
     let base_chunk = n / w;
     let remainder = n % w;
 
-    // Use a runtime task to coordinate
-    let flow = Flow::new();
-    let result = Arc::new(std::sync::Mutex::new(Ok(())));
+    let root_executor = executor.clone();
+    let output_for_tasks = Arc::clone(&output);
+    executor
+        .async_task(move || -> Result<(), FlowError> {
+            let tg = root_executor.task_group();
 
-    {
-        let result = Arc::clone(&result);
-        flow.spawn_runtime({
-            let input = Arc::clone(&input);
-            let output = Arc::clone(&output);
-            let block_sums = Arc::clone(&block_sums);
-            let counter = Arc::clone(&counter);
-            let op = Arc::clone(&op);
+            for worker_id in 0..w {
+                let start = worker_id * base_chunk + worker_id.min(remainder);
+                let end = start + base_chunk + if worker_id < remainder { 1 } else { 0 };
 
-            move |runtime| {
-                for worker_id in 0..w {
-                    let start = worker_id * base_chunk + worker_id.min(remainder);
-                    let end = start + base_chunk + if worker_id < remainder { 1 } else { 0 };
-
-                    if start >= end {
-                        continue;
-                    }
-
+                let task = {
+                    let executor = root_executor.clone();
                     let input = Arc::clone(&input);
-                    let output = Arc::clone(&output);
+                    let output = Arc::clone(&output_for_tasks);
                     let block_sums = Arc::clone(&block_sums);
                     let counter = Arc::clone(&counter);
                     let op = Arc::clone(&op);
 
-                    runtime.silent_async(move |_rt| {
-                        // Phase 1: Local scan - write directly to output (no lock needed)
+                    move || {
                         let mut acc = input[start].clone();
-                        unsafe { output.write(start, acc.clone()); }
+                        unsafe { output.write(start, acc.clone()) };
 
                         for i in start + 1..end {
                             acc = (op)(acc, input[i].clone());
-                            unsafe { output.write(i, acc.clone()); }
+                            unsafe { output.write(i, acc.clone()) };
                         }
 
-                        // Store block sum
-                        unsafe { *block_sums[worker_id].0.get() = acc; }
+                        unsafe { *block_sums[worker_id].0.get() = acc };
 
-                        // Barrier - last worker computes global prefix
-                        let arrived = counter.fetch_add(1, AtomicOrdering::AcqRel);
-                        if arrived == w - 1 {
-                            // Last worker: compute global prefix on block sums
+                        if counter.fetch_add(1, AtomicOrdering::AcqRel) == w - 1 {
                             let mut prefix: Option<T> = None;
                             for i in 0..w {
-                                let bs = unsafe { (*block_sums[i].0.get()).clone() };
+                                let block_sum = unsafe { (*block_sums[i].0.get()).clone() };
                                 prefix = Some(match prefix {
-                                    Some(p) => (op)(p, bs),
-                                    None => bs,
+                                    Some(running) => (op)(running, block_sum),
+                                    None => block_sum,
                                 });
-                                unsafe { *block_sums[i].0.get() = prefix.clone().unwrap(); }
+                                unsafe {
+                                    *block_sums[i].0.get() = prefix
+                                        .clone()
+                                        .expect("scan block prefix should exist");
+                                }
                             }
                             counter.store(0, AtomicOrdering::Release);
                         }
 
-                        // Worker 0: no adjustment needed
                         if worker_id == 0 {
                             return;
                         }
 
-                        // Wait for barrier using spin loop
-                        while counter.load(AtomicOrdering::Acquire) != 0 {
-                            std::hint::spin_loop();
-                        }
+                        executor.corun_until(|| counter.load(AtomicOrdering::Acquire) == 0);
 
-                        // Phase 2: Apply prefix from previous block
                         let prefix = unsafe { (*block_sums[worker_id - 1].0.get()).clone() };
                         for i in start..end {
                             unsafe {
@@ -193,18 +199,19 @@ where
                                 output.write(i, (op)(prefix.clone(), current));
                             }
                         }
-                    });
-                }
+                    }
+                };
 
-                if let Err(e) = runtime.corun_children() {
-                    *result.lock().expect("result lock") = Err(e);
+                if worker_id + 1 == w {
+                    task();
+                } else {
+                    tg.silent_async(task);
                 }
             }
-        });
-    }
 
-    executor.run(&flow).wait()?;
-    result.lock().expect("result lock").clone()?;
+            tg.corun()
+        })
+        .wait()??;
 
     // Collect results - safe because all workers have finished
     match Arc::try_unwrap(output) {
@@ -258,58 +265,60 @@ where
     let base_chunk = n / w;
     let remainder = n % w;
 
-    // Use a runtime task to coordinate
-    let flow = Flow::new();
-    let result = Arc::new(std::sync::Mutex::new(Ok(())));
+    for worker_id in 0..w {
+        let start = worker_id * base_chunk + worker_id.min(remainder);
+        let initial = if worker_id == 0 {
+            init.clone()
+        } else {
+            input[start - 1].clone()
+        };
+        unsafe {
+            *block_sums[worker_id].0.get() = initial;
+        }
+    }
 
-    {
-        let result = Arc::clone(&result);
-        flow.spawn_runtime({
-            let input = Arc::clone(&input);
-            let output = Arc::clone(&output);
-            let block_sums = Arc::clone(&block_sums);
-            let counter = Arc::clone(&counter);
-            let op = Arc::clone(&op);
+    let root_executor = executor.clone();
+    let output_for_tasks = Arc::clone(&output);
+    executor
+        .async_task(move || -> Result<(), FlowError> {
+            let tg = root_executor.task_group();
 
-            move |runtime| {
-                for worker_id in 0..w {
-                    let start = worker_id * base_chunk + worker_id.min(remainder);
-                    let end = start + base_chunk + if worker_id < remainder { 1 } else { 0 };
+            for worker_id in 0..w {
+                let start = worker_id * base_chunk + worker_id.min(remainder);
+                let end = start + base_chunk + if worker_id < remainder { 1 } else { 0 };
 
-                    if start >= end {
-                        continue;
-                    }
-
+                let task = {
+                    let executor = root_executor.clone();
                     let input = Arc::clone(&input);
-                    let output = Arc::clone(&output);
+                    let output = Arc::clone(&output_for_tasks);
                     let block_sums = Arc::clone(&block_sums);
                     let counter = Arc::clone(&counter);
                     let op = Arc::clone(&op);
-                    let init = init.clone();
 
-                    runtime.silent_async(move |_rt| {
-                        // Phase 1: Local exclusive scan
-                        let mut acc = if worker_id == 0 { init.clone() } else { input[start].clone() };
+                    move || {
+                        let mut acc = unsafe { (*block_sums[worker_id].0.get()).clone() };
 
-                        for i in start..end {
-                            unsafe { output.write(i, acc.clone()); }
-                            acc = (op)(acc, input[i].clone());
+                        for i in start + 1..end {
+                            unsafe { output.write(i - 1, acc.clone()) };
+                            acc = (op)(acc, input[i - 1].clone());
                         }
+                        unsafe { output.write(end - 1, acc.clone()) };
 
-                        // Store block sum
-                        unsafe { *block_sums[worker_id].0.get() = acc; }
+                        unsafe { *block_sums[worker_id].0.get() = acc };
 
-                        // Barrier - last worker computes global prefix
-                        let arrived = counter.fetch_add(1, AtomicOrdering::AcqRel);
-                        if arrived == w - 1 {
+                        if counter.fetch_add(1, AtomicOrdering::AcqRel) == w - 1 {
                             let mut prefix: Option<T> = None;
                             for i in 0..w {
-                                let bs = unsafe { (*block_sums[i].0.get()).clone() };
+                                let block_sum = unsafe { (*block_sums[i].0.get()).clone() };
                                 prefix = Some(match prefix {
-                                    Some(p) => (op)(p, bs),
-                                    None => bs,
+                                    Some(running) => (op)(running, block_sum),
+                                    None => block_sum,
                                 });
-                                unsafe { *block_sums[i].0.get() = prefix.clone().unwrap(); }
+                                unsafe {
+                                    *block_sums[i].0.get() = prefix
+                                        .clone()
+                                        .expect("scan block prefix should exist");
+                                }
                             }
                             counter.store(0, AtomicOrdering::Release);
                         }
@@ -318,12 +327,8 @@ where
                             return;
                         }
 
-                        // Wait for barrier
-                        while counter.load(AtomicOrdering::Acquire) != 0 {
-                            std::hint::spin_loop();
-                        }
+                        executor.corun_until(|| counter.load(AtomicOrdering::Acquire) == 0);
 
-                        // Phase 2: Apply prefix
                         let prefix = unsafe { (*block_sums[worker_id - 1].0.get()).clone() };
                         for i in start..end {
                             unsafe {
@@ -331,18 +336,19 @@ where
                                 output.write(i, (op)(prefix.clone(), current));
                             }
                         }
-                    });
-                }
+                    }
+                };
 
-                if let Err(e) = runtime.corun_children() {
-                    *result.lock().expect("result lock") = Err(e);
+                if worker_id + 1 == w {
+                    task();
+                } else {
+                    tg.silent_async(task);
                 }
             }
-        });
-    }
 
-    executor.run(&flow).wait()?;
-    result.lock().expect("result lock").clone()?;
+            tg.corun()
+        })
+        .wait()??;
 
     match Arc::try_unwrap(output) {
         Ok(buffer) => Ok(buffer.into_inner()),
@@ -375,8 +381,10 @@ where
         return Ok(input);
     }
 
-    // Larger cutoff to reduce parallel overhead
-    let sequential_cutoff = executor.num_workers().max(1).saturating_mul(4096);
+    let sequential_cutoff = options
+        .resolve_chunk_size_for_workers(input.len(), executor.num_workers())
+        .max(executor.num_workers().max(1) * SORT_SEQUENTIAL_CUTOFF_PER_WORKER);
+
     if input.len() <= sequential_cutoff {
         let mut input = input;
         input.sort_unstable_by(|left, right| compare(left, right));
@@ -384,84 +392,27 @@ where
     }
 
     let compare = Arc::new(compare);
-    // Use larger chunk size to reduce merge rounds
-    let chunk_size = options
-        .resolve_chunk_size_for_workers(input.len(), executor.num_workers())
-        .max(input.len() / executor.num_workers());
-    let chunks = split_chunks(input, chunk_size);
+    let len = input.len();
+    let mut input = input;
+    let data = SharedMutPtr::from_slice(input.as_mut_slice());
+    let root_executor = executor.clone();
 
-    if chunks.len() <= 1 {
-        return Ok(chunks
-            .into_iter()
-            .next()
-            .expect("parallel sort should preserve the non-empty input chunk"));
-    }
-
-    let handles = chunks
-        .into_iter()
-        .map(|mut chunk| {
-            let compare = Arc::clone(&compare);
-            executor.async_task(move || {
-                chunk.sort_unstable_by(|left, right| compare(left, right));
-                chunk
-            })
-        })
-        .collect::<Vec<_>>();
-
-    let mut chunks = wait_all(handles)?;
-
-    // Use sequential merge for small number of chunks to reduce scheduling overhead
-    while chunks.len() > 1 {
-        let parallel_merge = chunks.len() > 8;
-        let mut next_chunks = Vec::with_capacity(chunks.len().div_ceil(2));
-        let mut next_round = Vec::new();
-        let mut pending = chunks.into_iter();
-
-        while let Some(left) = pending.next() {
-            if let Some(right) = pending.next() {
-                if parallel_merge {
-                    let compare = Arc::clone(&compare);
-                    next_round.push(
-                        executor.async_task(move || merge_sorted(left, right, compare.as_ref())),
-                    );
-                } else {
-                    next_chunks.push(merge_sorted(left, right, compare.as_ref()));
-                }
-            } else {
-                next_chunks.push(left);
+    executor
+        .async_task(move || -> Result<(), FlowError> {
+            unsafe {
+                parallel_partition_sort(
+                    root_executor,
+                    data,
+                    0,
+                    len,
+                    compare,
+                    sequential_cutoff,
+                )
             }
-        }
+        })
+        .wait()??;
 
-        if parallel_merge {
-            next_chunks.extend(wait_all(next_round)?);
-        }
-        chunks = next_chunks;
-    }
-
-    Ok(chunks
-        .pop()
-        .expect("parallel sort should produce one output"))
-}
-
-fn merge_sorted<T, F>(left: Vec<T>, right: Vec<T>, compare: &F) -> Vec<T>
-where
-    F: Fn(&T, &T) -> Ordering,
-{
-    let mut left = left.into_iter().peekable();
-    let mut right = right.into_iter().peekable();
-    let mut merged = Vec::with_capacity(left.len() + right.len());
-
-    while let (Some(left_value), Some(right_value)) = (left.peek(), right.peek()) {
-        if compare(left_value, right_value) != Ordering::Greater {
-            merged.push(left.next().expect("left iterator should have a value"));
-        } else {
-            merged.push(right.next().expect("right iterator should have a value"));
-        }
-    }
-
-    merged.extend(left);
-    merged.extend(right);
-    merged
+    Ok(input)
 }
 
 fn sequential_inclusive_scan<T, F>(input: &[T], op: F) -> Vec<T>
@@ -501,27 +452,52 @@ where
     output
 }
 
-fn split_chunks<T>(input: Vec<T>, chunk_size: usize) -> Vec<Vec<T>> {
-    let mut chunks = Vec::new();
-    let mut input = input.into_iter();
-
-    loop {
-        let mut chunk = Vec::with_capacity(chunk_size);
-        for _ in 0..chunk_size {
-            match input.next() {
-                Some(value) => chunk.push(value),
-                None => break,
-            }
-        }
-
-        if chunk.is_empty() {
-            break;
-        }
-
-        chunks.push(chunk);
+unsafe fn parallel_partition_sort<T, F>(
+    executor: Executor,
+    data: SharedMutPtr<T>,
+    begin: usize,
+    end: usize,
+    compare: Arc<F>,
+    sequential_cutoff: usize,
+) -> Result<(), FlowError>
+where
+    T: Send + 'static,
+    F: Fn(&T, &T) -> Ordering + Send + Sync + 'static,
+{
+    let len = end - begin;
+    if len <= 1 {
+        return Ok(());
     }
 
-    chunks
+    if len <= sequential_cutoff {
+        let slice = unsafe { std::slice::from_raw_parts_mut(data.0.add(begin), len) };
+        slice.sort_unstable_by(|left, right| compare(left, right));
+        return Ok(());
+    }
+
+    let mid = len / 2;
+    let slice = unsafe { std::slice::from_raw_parts_mut(data.0.add(begin), len) };
+    slice.select_nth_unstable_by(mid, |left, right| compare(left, right));
+
+    let pivot = begin + mid;
+    let tg = executor.task_group();
+    let right_executor = executor.clone();
+    let right_compare = Arc::clone(&compare);
+
+    tg.silent_async(move || unsafe {
+        parallel_partition_sort(
+            right_executor,
+            data,
+            pivot + 1,
+            end,
+            right_compare,
+            sequential_cutoff,
+        )
+        .expect("parallel sort right partition should succeed");
+    });
+
+    unsafe { parallel_partition_sort(executor, data, begin, pivot, compare, sequential_cutoff)? };
+    tg.corun()
 }
 
 fn wait_all<T>(handles: Vec<AsyncHandle<T>>) -> Result<Vec<T>, FlowError> {

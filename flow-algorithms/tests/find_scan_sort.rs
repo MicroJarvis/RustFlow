@@ -90,6 +90,58 @@ fn parallel_exclusive_scan_matches_sequential_result() {
 }
 
 #[test]
+fn parallel_inclusive_scan_large_matches_sequential_result() {
+    let executor = Executor::new(4);
+    let input: Arc<[u64]> = (1..=20_000).collect::<Vec<_>>().into();
+
+    let output = parallel_inclusive_scan(
+        &executor,
+        Arc::clone(&input),
+        ParallelForOptions::default(),
+        |left, right| left + right,
+    )
+    .expect("large parallel inclusive scan should succeed");
+
+    let mut running = 0u64;
+    let expected = input
+        .iter()
+        .map(|value| {
+            running += value;
+            running
+        })
+        .collect::<Vec<_>>();
+
+    assert_eq!(output, expected);
+}
+
+#[test]
+fn parallel_exclusive_scan_large_matches_sequential_result() {
+    let executor = Executor::new(4);
+    let input: Arc<[u64]> = (1..=20_000).collect::<Vec<_>>().into();
+
+    let output = parallel_exclusive_scan(
+        &executor,
+        Arc::clone(&input),
+        ParallelForOptions::default(),
+        7u64,
+        |left, right| left + right,
+    )
+    .expect("large parallel exclusive scan should succeed");
+
+    let mut running = 7u64;
+    let expected = input
+        .iter()
+        .map(|value| {
+            let current = running;
+            running += value;
+            current
+        })
+        .collect::<Vec<_>>();
+
+    assert_eq!(output, expected);
+}
+
+#[test]
 fn parallel_sort_matches_std_sort() {
     let executor = Executor::new(4);
     let input = vec![9, 3, 7, 1, 8, 2, 6, 5, 4, 0, 7, 3, 9, 2];
@@ -120,6 +172,26 @@ fn parallel_sort_by_supports_custom_order() {
         |left: &i32, right: &i32| right.cmp(left),
     )
     .expect("parallel sort by should succeed");
+
+    assert_eq!(output, expected);
+}
+
+#[test]
+fn parallel_sort_large_matches_std_sort() {
+    let executor = Executor::new(4);
+    let input = (0..50_000)
+        .rev()
+        .map(|index| ((index as u64 * 48_271 + 1_234_567) % 100_003) as i32)
+        .collect::<Vec<_>>();
+    let mut expected = input.clone();
+    expected.sort_unstable();
+
+    let output = parallel_sort(
+        &executor,
+        input,
+        ParallelForOptions::default(),
+    )
+    .expect("large parallel sort should succeed");
 
     assert_eq!(output, expected);
 }

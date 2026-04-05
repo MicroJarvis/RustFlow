@@ -37,4 +37,4 @@
 
 - [Epics](./epics.md)
 - [Stories](./stories.md)
-- [Taskflow Performance Plan](./taskflow-performance-plan.md)
+- [Latest Taskflow Performance Plan](./plans/2026-04-05-post-lockfree-queue-performance-plan.md)

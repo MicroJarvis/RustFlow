@@ -2,6 +2,7 @@ use std::cell::RefCell;
 use std::collections::VecDeque;
 use std::fmt;
 use std::rc::Rc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, RwLock};
 
 use crate::runtime::RuntimeCtx;
@@ -321,6 +322,52 @@ fn snapshot_graph(graph: &Graph) -> GraphSnapshot {
 struct FlowInner {
     name: RwLock<String>,
     graph: RwLock<Graph>,
+    snapshot_generation: AtomicUsize,
+    snapshot_cache: RwLock<Option<CachedGraphSnapshot>>,
+}
+
+struct CachedGraphSnapshot {
+    generation: usize,
+    snapshot: Arc<GraphSnapshot>,
+}
+
+impl FlowInner {
+    fn mark_graph_dirty(&self) {
+        self.snapshot_generation.fetch_add(1, Ordering::AcqRel);
+    }
+
+    fn snapshot(&self) -> Arc<GraphSnapshot> {
+        let generation = self.snapshot_generation.load(Ordering::Acquire);
+        if let Some(snapshot) = self
+            .snapshot_cache
+            .read()
+            .expect("flow snapshot cache poisoned")
+            .as_ref()
+            .and_then(|cached| {
+                (cached.generation == generation).then(|| Arc::clone(&cached.snapshot))
+            })
+        {
+            return snapshot;
+        }
+
+        let graph = self.graph.read().expect("flow graph poisoned");
+        let generation = self.snapshot_generation.load(Ordering::Acquire);
+        let snapshot = Arc::new(snapshot_graph(&graph));
+        drop(graph);
+
+        let mut cache = self
+            .snapshot_cache
+            .write()
+            .expect("flow snapshot cache poisoned");
+        if self.snapshot_generation.load(Ordering::Acquire) == generation {
+            *cache = Some(CachedGraphSnapshot {
+                generation,
+                snapshot: Arc::clone(&snapshot),
+            });
+        }
+
+        snapshot
+    }
 }
 
 #[derive(Clone)]
@@ -344,6 +391,8 @@ impl Flow {
             inner: Arc::new(FlowInner {
                 name: RwLock::new(name.into()),
                 graph: RwLock::new(Graph::default()),
+                snapshot_generation: AtomicUsize::new(0),
+                snapshot_cache: RwLock::new(None),
             }),
         }
     }
@@ -455,9 +504,8 @@ impl Flow {
         })
     }
 
-    pub(crate) fn snapshot(&self) -> GraphSnapshot {
-        let graph = self.inner.graph.read().expect("flow graph poisoned");
-        snapshot_graph(&graph)
+    pub(crate) fn snapshot(&self) -> Arc<GraphSnapshot> {
+        self.inner.snapshot()
     }
 }
 
@@ -514,6 +562,8 @@ impl FlowBuilder {
         let mut graph = self.flow.graph.write().expect("flow graph poisoned");
         let id = TaskId(graph.nodes.len());
         graph.nodes.push(Node::new(kind));
+        drop(graph);
+        self.flow.mark_graph_dirty();
         TaskHandle {
             flow: Arc::clone(&self.flow),
             id,
@@ -543,6 +593,8 @@ impl TaskHandle {
     pub fn name(&self, name: impl Into<String>) -> Self {
         let mut graph = self.flow.graph.write().expect("flow graph poisoned");
         graph.nodes[self.id.0].name = Some(name.into());
+        drop(graph);
+        self.flow.mark_graph_dirty();
         self.clone()
     }
 
@@ -554,12 +606,16 @@ impl TaskHandle {
     pub fn acquire(&self, semaphore: &Semaphore) -> Self {
         let mut graph = self.flow.graph.write().expect("flow graph poisoned");
         graph.nodes[self.id.0].to_acquire.push(semaphore.clone());
+        drop(graph);
+        self.flow.mark_graph_dirty();
         self.clone()
     }
 
     pub fn release(&self, semaphore: &Semaphore) -> Self {
         let mut graph = self.flow.graph.write().expect("flow graph poisoned");
         graph.nodes[self.id.0].to_release.push(semaphore.clone());
+        drop(graph);
+        self.flow.mark_graph_dirty();
         self.clone()
     }
 
@@ -575,6 +631,8 @@ impl TaskHandle {
             );
             add_edge(&mut graph, self.id, task.id);
         }
+        drop(graph);
+        self.flow.mark_graph_dirty();
         self.clone()
     }
 

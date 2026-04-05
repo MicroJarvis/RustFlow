@@ -1,20 +1,23 @@
 //! Lightweight TaskGroup for cooperative parallel task spawning.
 //!
 //! This module provides a TaskGroup API similar to Taskflow's design:
-//! - Embedded join counter (no Arc overhead for tracking)
+//! - Shared runtime-child fast path with no RunHandle allocation per child
 //! - Simplified API without RuntimeCtx parameter
 //! - Cooperative waiting with work-stealing
 
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use crate::error::FlowError;
 use crate::executor::Executor;
+use crate::runtime::RuntimeJoinScope;
+use crate::util::WaitBackoff;
 
 /// A lightweight task group for cooperative parallel task spawning.
 ///
-/// Unlike `RuntimeCtx::silent_async`, TaskGroup uses an embedded join counter
-/// instead of `Arc<RuntimeJoinScope>`, reducing per-task overhead.
+/// Unlike `Executor::silent_async`, TaskGroup routes through the same
+/// parent-linked child path used by runtime silent children, so child tasks do
+/// not allocate a `RunHandle`.
 ///
 /// # Example
 ///
@@ -28,21 +31,19 @@ use crate::executor::Executor;
 /// ```
 pub struct TaskGroup {
     executor: Executor,
-    worker_id: usize,
-    join_counter: Arc<AtomicUsize>,
+    worker_id: Option<usize>,
+    join_scope: Arc<RuntimeJoinScope>,
     cancelled: Arc<AtomicBool>,
-    has_error: Arc<AtomicBool>,
 }
 
 impl TaskGroup {
     /// Create a new TaskGroup bound to a specific executor and worker.
-    pub(crate) fn new(executor: Executor, worker_id: usize) -> Self {
+    pub(crate) fn new(executor: Executor, worker_id: Option<usize>) -> Self {
         Self {
             executor,
             worker_id,
-            join_counter: Arc::new(AtomicUsize::new(0)),
+            join_scope: Arc::new(RuntimeJoinScope::default()),
             cancelled: Arc::new(AtomicBool::new(false)),
-            has_error: Arc::new(AtomicBool::new(false)),
         }
     }
 
@@ -58,26 +59,20 @@ impl TaskGroup {
             return;
         }
 
-        self.join_counter.fetch_add(1, Ordering::AcqRel);
-
-        let counter = Arc::clone(&self.join_counter);
-        let error_flag = Arc::clone(&self.has_error);
         let cancelled = Arc::clone(&self.cancelled);
+        self.executor.schedule_runtime_silent_child(
+            Box::new(move |_| {
+                if cancelled.load(Ordering::Acquire) {
+                    return Ok(());
+                }
 
-        let _handle = self.executor.silent_async(move || {
-            if cancelled.load(Ordering::Acquire) {
-                counter.fetch_sub(1, Ordering::AcqRel);
-                return;
-            }
-
-            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(task));
-
-            counter.fetch_sub(1, Ordering::AcqRel);
-
-            if result.is_err() {
-                error_flag.store(true, Ordering::Release);
-            }
-        });
+                task();
+                Ok(())
+            }),
+            self.worker_id,
+            Arc::clone(&self.cancelled),
+            Arc::clone(&self.join_scope),
+        );
     }
 
     /// Wait for all spawned tasks to complete.
@@ -85,15 +80,25 @@ impl TaskGroup {
     /// This uses cooperative waiting - the worker participates in
     /// work-stealing while waiting for the counter to reach zero.
     pub fn corun(&self) -> Result<(), FlowError> {
-        self.executor.wait_until_inline(self.worker_id, || {
-            self.join_counter.load(Ordering::Acquire) == 0
-        });
-
-        if self.has_error.load(Ordering::Acquire) {
-            Err(FlowError::plain("task in task group panicked"))
-        } else {
-            Ok(())
+        match self.worker_id {
+            Some(worker_id) => self
+                .executor
+                .wait_until_inline(worker_id, || self.join_scope.is_idle()),
+            None => {
+                let mut backoff = WaitBackoff::new();
+                while !self.join_scope.is_idle() {
+                    if !backoff.try_snooze() {
+                        std::thread::yield_now();
+                    }
+                }
+            }
         }
+
+        if self.join_scope.take_error().is_some() {
+            return Err(FlowError::plain("task in task group panicked"));
+        }
+
+        Ok(())
     }
 
     /// Cancel all pending tasks in this group.
@@ -111,6 +116,6 @@ impl TaskGroup {
 
     /// Get the number of pending tasks.
     pub fn size(&self) -> usize {
-        self.join_counter.load(Ordering::Acquire)
+        self.join_scope.pending_children()
     }
 }

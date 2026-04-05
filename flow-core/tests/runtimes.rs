@@ -221,6 +221,32 @@ fn runtime_fibonacci(runtime: &RuntimeCtx, n: usize) -> usize {
             .expect("right runtime async should succeed")
 }
 
+fn task_group_fibonacci(executor: Executor, n: usize) -> usize {
+    if n < 2 {
+        return n;
+    }
+
+    let tg = executor.task_group();
+    let left_executor = executor.clone();
+    let left_slot = Arc::new(Mutex::new(None));
+    {
+        let left_slot = Arc::clone(&left_slot);
+        tg.silent_async(move || {
+            *left_slot.lock().expect("task-group left slot poisoned") =
+                Some(task_group_fibonacci(left_executor, n - 1));
+        });
+    }
+    let right = task_group_fibonacci(executor.clone(), n - 2);
+    tg.corun()
+        .expect("task-group fibonacci child should succeed");
+    left_slot
+        .lock()
+        .expect("task-group left slot poisoned")
+        .take()
+        .expect("task-group left slot should be initialized")
+        + right
+}
+
 #[test]
 fn runtime_async_can_wait_inline_on_a_single_worker() {
     let executor = Executor::new(1);
@@ -243,6 +269,38 @@ fn runtime_async_can_wait_inline_on_a_single_worker() {
         result.lock().expect("result slot poisoned").take(),
         Some(55)
     );
+}
+
+#[test]
+fn executor_task_group_can_wait_inline_on_a_single_worker() {
+    let executor = Executor::new(1);
+    let root_executor = executor.clone();
+
+    let result = executor
+        .async_task(move || task_group_fibonacci(root_executor, 10))
+        .wait()
+        .expect("task-group recursion should succeed");
+
+    assert_eq!(result, 55);
+}
+
+#[test]
+fn executor_task_group_can_wait_from_an_external_thread() {
+    let executor = Executor::new(2);
+    let tg = executor.task_group();
+    let hits = Arc::new(AtomicUsize::new(0));
+
+    for _ in 0..4 {
+        let hits = Arc::clone(&hits);
+        tg.silent_async(move || {
+            hits.fetch_add(1, Ordering::SeqCst);
+        });
+    }
+
+    tg.corun()
+        .expect("external-thread task-group wait should succeed");
+
+    assert_eq!(hits.load(Ordering::SeqCst), 4);
 }
 
 #[test]
@@ -431,6 +489,37 @@ fn runtime_corun_children_surfaces_child_panics() {
         .run(&flow)
         .wait()
         .expect("parent runtime flow should succeed when panic is handled");
+
+    assert!(saw_error.load(Ordering::SeqCst));
+}
+
+#[test]
+fn task_group_corun_surfaces_child_panics() {
+    let executor = Executor::new(1);
+    let flow = Flow::new();
+    let saw_error = Arc::new(AtomicBool::new(false));
+
+    {
+        let executor = executor.clone();
+        let saw_error = Arc::clone(&saw_error);
+        flow.spawn_runtime(move |_| {
+            let tg = executor.task_group();
+            tg.silent_async(|| {
+                panic!("task group child boom");
+            });
+
+            let error = tg
+                .corun()
+                .expect_err("task-group child panic should surface");
+            assert!(error.message().contains("task in task group panicked"));
+            saw_error.store(true, Ordering::SeqCst);
+        });
+    }
+
+    executor
+        .run(&flow)
+        .wait()
+        .expect("parent runtime flow should succeed when task-group panic is handled");
 
     assert!(saw_error.load(Ordering::SeqCst));
 }

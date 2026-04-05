@@ -13,6 +13,8 @@ use crate::error::FlowError;
 use crate::flow::{Flow, GraphSnapshot, NodeSnapshot, Subflow, TaskId, TaskKind};
 use crate::observer::Observer;
 use crate::runtime::{RuntimeCtx, RuntimeJoinScope};
+use crate::task_group::TaskGroup;
+use crate::util::WaitBackoff;
 
 const WORKER_STACK_SIZE: usize = 16 * 1024 * 1024;
 
@@ -217,7 +219,7 @@ impl Executor {
     }
 
     pub fn run(&self, flow: &Flow) -> RunHandle {
-        self.start_run(Arc::new(flow.snapshot()), None)
+        self.start_run(flow.snapshot(), None)
     }
 
     pub fn run_n(&self, flow: &Flow, n: usize) -> RunHandle {
@@ -268,10 +270,37 @@ impl Executor {
 
     pub fn wait_for_all(&self) {
         let mut known_epoch = self.inner.run_completion.current_epoch();
+        let mut backoff = WaitBackoff::new();
         while self.inner.active_runs.load(Ordering::Acquire) > 0 {
-            self.inner
-                .run_completion
-                .wait(&mut known_epoch, &self.inner.shutdown);
+            if self.inner.shutdown.load(Ordering::Acquire) {
+                return;
+            }
+            if backoff.try_snooze() {
+                continue;
+            }
+            self.inner.run_completion.wait(
+                &mut known_epoch,
+                &self.inner.active_runs,
+                &self.inner.shutdown,
+            );
+            backoff = WaitBackoff::new();
+        }
+    }
+
+    pub fn corun_until<P>(&self, mut predicate: P)
+    where
+        P: FnMut() -> bool,
+    {
+        if let Some(worker_id) = self.current_worker_id() {
+            self.wait_until_inline(worker_id, || predicate());
+            return;
+        }
+
+        let mut backoff = WaitBackoff::new();
+        while !predicate() {
+            if !backoff.try_snooze() {
+                thread::yield_now();
+            }
         }
     }
 
@@ -282,6 +311,10 @@ impl Executor {
             .write()
             .expect("executor observers poisoned")
             .push(observer);
+    }
+
+    pub fn task_group(&self) -> TaskGroup {
+        TaskGroup::new(self.clone(), self.current_worker_id())
     }
 
     pub fn async_task<F, T>(&self, task: F) -> AsyncHandle<T>
@@ -378,7 +411,7 @@ impl Executor {
     }
 
     pub(crate) fn corun_inline(&self, flow: &Flow, worker_id: usize) -> Result<(), FlowError> {
-        let handle = self.start_run(Arc::new(flow.snapshot()), Some(worker_id));
+        let handle = self.start_run(flow.snapshot(), Some(worker_id));
         self.wait_handle_inline(&handle, worker_id)
     }
 
@@ -464,7 +497,7 @@ impl Executor {
     pub(crate) fn schedule_runtime_silent_child(
         &self,
         runner: Box<dyn FnOnce(&RuntimeCtx) -> Result<(), FlowError> + Send + 'static>,
-        worker_hint: usize,
+        worker_hint: Option<usize>,
         runtime_cancelled: Arc<AtomicBool>,
         join_scope: Arc<RuntimeJoinScope>,
     ) {
@@ -472,7 +505,7 @@ impl Executor {
         self.inner.increment_active_runs();
         self.inner.enqueue_async(
             ScheduledAsyncTask::runtime_child(runner, runtime_cancelled, join_scope),
-            Some(worker_hint),
+            worker_hint,
         );
     }
 
@@ -480,6 +513,14 @@ impl Executor {
         CURRENT_RUNTIME_SPAWN_CONTEXT.with(|slot| {
             let context = slot.borrow().clone()?;
             Arc::ptr_eq(&context.executor, &self.inner).then_some(context)
+        })
+    }
+
+    fn current_worker_id(&self) -> Option<usize> {
+        WORKER_LOCAL.with(|slot| {
+            slot.borrow()
+                .as_ref()
+                .map(|local| local.worker_id)
         })
     }
 
@@ -607,9 +648,12 @@ impl RunCompletionEvent {
         self.ready.notify_all();
     }
 
-    fn wait(&self, known_epoch: &mut u64, shutdown: &AtomicBool) {
+    fn wait(&self, known_epoch: &mut u64, active_runs: &AtomicUsize, shutdown: &AtomicBool) {
         let mut epoch = self.epoch.lock().expect("run completion poisoned");
-        while *epoch == *known_epoch && !shutdown.load(Ordering::Acquire) {
+        while *epoch == *known_epoch
+            && active_runs.load(Ordering::Acquire) > 0
+            && !shutdown.load(Ordering::Acquire)
+        {
             epoch = self
                 .ready
                 .wait(epoch)
@@ -619,8 +663,8 @@ impl RunCompletionEvent {
     }
 }
 
-/// Per-worker local state stored in thread-local storage.
-/// This allows enqueue operations from within a worker to push directly to its local queue.
+// Per-worker local state stored in thread-local storage.
+// This allows enqueue operations from within a worker to push directly to its local queue.
 thread_local! {
     static WORKER_LOCAL: RefCell<Option<WorkerLocalState>> = RefCell::new(None);
 }
@@ -1405,7 +1449,7 @@ fn execute_node_inline(
         }
         TaskKind::Composed(flow) => {
             let snapshot = flow.snapshot();
-            execute_graph_inline(&snapshot, executor, worker_id, cancelled)?;
+            execute_graph_inline(snapshot.as_ref(), executor, worker_id, cancelled)?;
             Ok(None)
         }
     }

@@ -50,17 +50,18 @@ cargo run -p benchmarks -- \
   - parallel algorithms implemented on top of `flow-core`
 - `benchmarks`
   - benchmark harness and C++ Taskflow comparison driver
-- `doc`
-  - development plan, epics, and stories
+- `docs`
+  - development plan, epics, stories, and current performance work plan
 - `taskflow`
   - local reference checkout of the upstream C++ project, not part of the Rust workspace
 
 ## Documents
 
-- `doc/development-plan.md`
-- `doc/epics.md`
-- `doc/stories.md`
-- `doc/taskflow-performance-plan.md`
+- `docs/development-plan.md`
+- `docs/epics.md`
+- `docs/stories.md`
+- `docs/plans/2026-04-05-post-lockfree-queue-performance-plan.md`
+- `benchmarks/reports/taskflow_compare/current_live_20260405/taskflow_vs_rustflow_report.md`
 
 ## Suggested Next Focus
 

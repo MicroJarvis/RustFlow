@@ -125,6 +125,39 @@ fn repeated_runs_reuse_the_same_graph() {
 }
 
 #[test]
+fn graph_mutation_after_a_run_is_visible_to_the_next_snapshot() {
+    let executor = Executor::new(2);
+    let flow = Flow::new();
+    let counter = Arc::new(AtomicUsize::new(0));
+
+    {
+        let counter = Arc::clone(&counter);
+        flow.spawn(move || {
+            counter.fetch_add(1, Ordering::SeqCst);
+        });
+    }
+
+    executor
+        .run(&flow)
+        .wait()
+        .expect("first run should succeed");
+
+    {
+        let counter = Arc::clone(&counter);
+        flow.spawn(move || {
+            counter.fetch_add(10, Ordering::SeqCst);
+        });
+    }
+
+    executor
+        .run(&flow)
+        .wait()
+        .expect("second run should observe the mutated graph");
+
+    assert_eq!(counter.load(Ordering::SeqCst), 12);
+}
+
+#[test]
 fn run_n_executes_n_times() {
     let executor = Executor::new(2);
     let flow = Flow::new();
