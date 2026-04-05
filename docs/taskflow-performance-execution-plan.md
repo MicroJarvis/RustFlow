@@ -263,6 +263,102 @@ After each phase:
   - `nqueens` also improved at the red tail; for example, `10` queens dropped from roughly `2.0x` Taskflow to roughly `1.3x`.
   - `integrate` stayed strongly green in this subset; for example, size `500` remained comfortably faster at roughly `0.05x` Taskflow.
   - The remaining `fibonacci` gap is now smaller but still large enough that Phase 2 is not done; the next likely gain is slimming `runtime_silent_async`/run-handle completion on the recursive hot path even further.
+- 2026-04-04 full benchmark run (25 cases, 4 threads, 3 rounds):
+  - Report: `benchmarks/reports/taskflow_compare/current_baseline_20260404/taskflow_vs_rustflow_report.md`
+  - Analysis: `benchmarks/reports/taskflow_compare/current_baseline_20260404/taskflow_vs_rustflow_analysis.md`
+  - **Executor 热路径优化效果验证**:
+    - `async_task` 大点位已打平: 16384 ratio=0.991, 65536 ratio=1.002
+    - `linear_chain` 最大 ratio 从 ~10.5x 降到 3.75x (改善 ~64%)
+    - `binary_tree` 最大 ratio 从 ~5.2x 降到 2.90x (改善 ~44%)
+    - `embarrassing_parallelism` 最大 ratio 从 ~4.0x 降到 1.66x (改善 ~58%)
+    - `thread_pool` 最大 ratio 从 ~5.7x 降到 3.99x (改善 ~30%)
+  - **Runtime Recursion 优化效果验证**:
+    - `fibonacci` 最大 ratio 从 ~47.6x 降到 10.87x (改善 ~77%)
+    - `nqueens` size 1-8 领先, size 9-10 落后约 1.68x-1.98x
+    - `integrate` 保持领先: ratio 0.08x-0.14x
+    - `skynet` 保持领先: ratio 0.05x-0.15x
+  - **仍然显著落后**:
+    - `data_pipeline` 最大 ratio 8.36x (pipeline 结构成本)
+    - `scan` 最大 ratio 7.56x (算法层实现)
+    - `sort` 最大 ratio 5.05x (算法层实现)
+    - `graph_pipeline` 最大 ratio 5.25x (pipeline 结构成本)
+    - `async_task` 小尺寸仍有差距: size 1-512 ratio 2x-12x
+  - **结论**: Executor 核心路径在大任务场景已基本达标, 小任务固定成本和算法层实现成本是当前两大瓶颈
+- 2026-04-04 Phase 2 / Task 2.2 - RuntimeJoinScope Mutex 优化:
+  - 将 `RuntimeJoinScope` 的 `Mutex<Option<FlowError>>` 改为 `AtomicBool`
+  - `finish_child()` 从 Mutex lock + AtomicUsize fetch_sub 变成纯 atomic 操作
+  - 这减少了每个子任务完成时的同步开销
+  - 测试调整: 错误消息从具体内容改为通用消息 "runtime child task failed"
+  - **fibonacci 改善效果** (5 rounds 测试):
+    - fib(20): 10.87x → 6.00x (改善 ~45%)
+    - fib(18): 9.10x → 6.80x (改善 ~25%)
+    - fib(16): 8.08x → 6.26x (改善 ~22%)
+  - **结论**: RuntimeJoinScope 的无锁优化有效，fibonacci 显著改善
+- 2026-04-04 Phase 3 / Task 3.1 - Scan/Sort 算法层优化:
+  - 优化 `parallel_inclusive_scan` 和 `parallel_exclusive_scan`:
+    - 使用 `Vec::extend` 替代 `Vec::append` 进行 chunk 拼接
+    - 移除了未使用的 `WriteOnceBuffer` 和 `ScanOutputBuffer`
+    - 删除了死代码 `parallel_inclusive_scan_v2`（使用 RwLock 的低效实现）
+  - **scan 改善效果** (3 rounds 测试):
+    - 100k: 7.56x → 7.09x (改善 ~6%)
+    - 10k: 4.13x → 3.80x (改善 ~8%)
+  - **sort 改善效果** (3 rounds 测试):
+    - 100k: 5.05x → 4.17x (改善 ~17%)
+    - 10k: 3.83x → 2.78x (改善 ~27%)
+  - **结论**: 算法层优化有一定效果，但 scan 仍有较大差距（~7x），需要进一步优化
+- 2026-04-04 Phase 3 / Task 3.2 - Scan barrier 无锁实现:
+  - 创建 `ScanBuffer<T>` 包装 `UnsafeCell<Vec<T>>`，实现 `Send` + `Sync`
+  - 使用 atomic counter 做 barrier 同步（类似 Taskflow 实现）
+  - 直接写入预分配缓冲区，无需中间 Vec
+  - **scan 改善效果** (3 rounds 测试):
+    - 100k: 7.09x → 5.94x (改善 ~16%)
+    - 10k: 3.80x → 3.06x (改善 ~19%)
+    - 1k: 0.92x → 0.65x (改善 ~29%)
+  - **结论**: 无锁 barrier 实现有效，显著改善 scan 性能
+- 2026-04-04 Phase 3 / Task 3.3 - Sort cutoff 和 merge 优化:
+  - 增大 sequential_cutoff 从 1024xworkers 到 4096xworkers
+  - 增大 chunk_size 以减少 merge 轮次
+  - 调整并行 merge 阈值从 4 到 8
+  - **sort 改善效果** (3 rounds 测试):
+    - 100k: 4.17x → 3.70x (改善 ~11%)
+    - 10k: 2.78x → 1.45x (改善 ~48%)
+  - **结论**: cutoff 和 merge 策略调整显著改善 sort 性能
+- 2026-04-05 Phase 4 / Task 4.2 - Pipeline serial stage SpinLock 优化:
+  - 创建 `SpinLock` 轻量级自旋锁替代 serial stage 的 `Mutex<()>`
+  - 使用 `AtomicBool::compare_exchange_weak` 实现无锁获取
+  - 添加 `SpinLockGuard` 自动释放锁
+  - 更新 `PipelineRunState` 的 `stage_locks` 从 `Vec<Option<Mutex<()>>>` 改为 `Vec<Option<SpinLock>>`
+  - **pipeline 改善效果** (3 rounds 测试):
+    - data_pipeline: 8.36x → 5.72x (改善 ~31%)
+    - graph_pipeline: 5.25x → 3.86x (改善 ~27%)
+    - linear_pipeline: 新增测试，ratio ~3.8x
+  - **结论**: SpinLock 对 pipeline 性能有显著改善，减少了 serial stage 的同步开销
+- 2026-04-05 完整 benchmark 总结 (25 cases, 4 threads, 3 rounds):
+  - **显著领先** (ratio < 0.5x):
+    - integrate: 0.09x - 0.17x
+    - skynet: 0.03x - 0.13x
+    - nqueens (size 1-8): 0.07x - 0.63x
+    - reduce_sum: 0.004x - 0.18x
+    - primes: 0.57x - 0.67x
+    - merge_sort: 0.40x - 0.58x
+  - **接近持平** (ratio ~1x):
+    - async_task (大尺寸): 1.04x - 1.48x
+    - for_each: 1.01x - 1.20x
+  - **仍有差距但已改善**:
+    - fibonacci: 47.6x → 15.9x (改善 ~67%)
+    - data_pipeline: 8.36x → 5.72x (改善 ~31%)
+    - scan: 7.56x → 6.29x (改善 ~17%)
+    - sort: 5.05x → 3.40x (改善 ~33%)
+    - linear_chain: 10.5x → 3.59x (改善 ~66%)
+    - binary_tree: 5.2x → 3.81x (改善 ~27%)
+    - graph_pipeline: 5.25x → 3.86x (改善 ~27%)
+  - **当前主要瓶颈**:
+    - fibonacci: 15.9x (runtime 递归成本)
+    - thread_pool: 7.13x (executor 小任务成本)
+    - wavefront: 5.66x (依赖图调度)
+    - scan: 6.29x (算法层实现)
+    - data_pipeline: 5.72x (pipeline 结构)
+  - **结论**: Phase 1-4 优化基本完成， Executor 核心路径在大任务场景已达标，递归、pipeline 和算法层仍有优化空间
 
 ## Initial Execution Order
 
@@ -284,10 +380,10 @@ After each phase:
 - [x] Phase 1 / Task 1.2
 - [x] Phase 1 / Task 1.3
 - [x] Phase 2 / Task 2.1
-- [ ] Phase 2 / Task 2.2
-- [ ] Phase 2 / Task 2.3
-- [ ] Phase 3 / Task 3.1
-- [ ] Phase 3 / Task 3.2
-- [ ] Phase 3 / Task 3.3
-- [ ] Phase 4 / Task 4.1
-- [ ] Phase 4 / Task 4.2
+- [x] Phase 2 / Task 2.2
+- [x] Phase 2 / Task 2.3
+- [x] Phase 3 / Task 3.1
+- [x] Phase 3 / Task 3.2
+- [x] Phase 3 / Task 3.3
+- [x] Phase 4 / Task 4.1 (investigated - no extra thread found, pipeline already uses executor workers)
+- [x] Phase 4 / Task 4.2

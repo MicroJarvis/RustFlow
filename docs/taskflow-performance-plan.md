@@ -67,33 +67,41 @@
 - runtime recursion 必须支持 worker 内联等待
 - 深层递归必须允许顺序回退，避免任务风暴和栈问题
 
-## 最新基线结论
+## 最新基线结论（2026-04-04）
 
-截至最新分析，现状可以概括为：
+截至最新全量测试，现状可以概括为：
 
 ### 已明显收敛或已领先
 
-- `integrate`：基本解决
-- `skynet`：整体领先
-- `nqueens`：只在大尺寸尾部落后
-- `for_each`：大点位已接近打平
-- `mandelbrot`：基本打平
-- `matrix_multiplication`：当前领先
+- `integrate`：**大幅领先**（ratio 0.08x-0.14x）
+- `skynet`：**整体领先**（ratio 0.05x-0.15x）
+- `nqueens`：**大部分领先**（size 1-8 领先，size 9-10 约 1.7x-2.0x）
+- `for_each`：**大点位打平**（size 10k-100k ratio 约 0.97x-0.98x）
+- `async_task`：**大点位收敛**（size 16k-64k ratio 约 1.0x）
+- `primes`：**整体领先**（ratio 0.45x-0.56x）
+- `reduce_sum`：**领先**（ratio 0.01x-0.79x）
+- `graph_traversal`：**领先**（ratio 0.66x-0.96x）
+
+### Phase 1/2 优化已验证有效
+
+| Benchmark | 当前最差 ratio | 上一轮最差 ratio | 改善幅度 |
+|-----------|---------------|-----------------|----------|
+| `fibonacci` | 10.87x | ~47.6x | **~77%** |
+| `linear_chain` | 3.75x | ~10.5x | **~64%** |
+| `embarrassing_parallelism` | 1.66x | ~4.0x | **~58%** |
+| `async_task` (小尺寸) | 12.56x | ~30x | **~58%** |
+| `binary_tree` | 2.90x | ~5.2x | **~44%** |
+| `thread_pool` | 3.99x | ~5.7x | **~30%** |
 
 ### 仍然最值得优先处理
 
-- `async_task`
-- `linear_chain`
-- `binary_tree`
-- `embarrassing_parallelism`
-- `thread_pool`
-- `fibonacci`
-- `scan`
-- `sort`
-- `primes`
-- `wavefront`
-- `data_pipeline`
-- `graph_pipeline`
+- `async_task`（小尺寸固定成本）
+- `linear_chain`（小尺寸固定成本）
+- `fibonacci`（runtime recursion 热路径）
+- `scan`（算法层实现）
+- `sort`（算法层实现）
+- `data_pipeline`（pipeline 结构成本）
+- `graph_pipeline`（pipeline 结构成本）
 
 ## 开发主线
 

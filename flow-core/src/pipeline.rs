@@ -4,6 +4,48 @@ use std::mem::MaybeUninit;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 
+/// A lightweight spinlock for short-held critical sections.
+/// More efficient than Mutex for very short lock durations.
+struct SpinLock {
+    locked: AtomicBool,
+}
+
+// SAFETY: SpinLock uses AtomicBool which is inherently thread-safe.
+// The lock can be safely shared between threads.
+unsafe impl Send for SpinLock {}
+unsafe impl Sync for SpinLock {}
+
+impl SpinLock {
+    fn new() -> Self {
+        Self {
+            locked: AtomicBool::new(false),
+        }
+    }
+
+    fn lock(&self) -> SpinLockGuard<'_> {
+        // Spin until we acquire the lock
+        while self
+            .locked
+            .compare_exchange_weak(false, true, Ordering::Acquire, Ordering::Relaxed)
+            .is_err()
+        {
+            // Use spin_loop hint to reduce contention
+            std::hint::spin_loop();
+        }
+        SpinLockGuard { locked: &self.locked }
+    }
+}
+
+struct SpinLockGuard<'a> {
+    locked: &'a AtomicBool,
+}
+
+impl<'a> Drop for SpinLockGuard<'a> {
+    fn drop(&mut self) {
+        self.locked.store(false, Ordering::Release);
+    }
+}
+
 use crate::Executor;
 use crate::error::FlowError;
 use crate::executor::RunHandle;
@@ -567,11 +609,11 @@ struct PipelineRunState {
     next_token: AtomicUsize,
     stopped: AtomicBool,
     cancelled: Arc<AtomicBool>,
-    stage_locks: Vec<Option<Mutex<()>>>,
+    stage_locks: Vec<Option<SpinLock>>,
 }
 
 impl PipelineRunState {
-    fn new(stage_locks: Vec<Option<Mutex<()>>>, cancelled: Arc<AtomicBool>) -> Self {
+    fn new(stage_locks: Vec<Option<SpinLock>>, cancelled: Arc<AtomicBool>) -> Self {
         Self {
             next_token: AtomicUsize::new(0),
             stopped: AtomicBool::new(false),
@@ -600,7 +642,7 @@ fn run_pipe_chain(
     let run_state = Arc::new(PipelineRunState::new(
         pipes
             .iter()
-            .map(|pipe| (pipe.pipe_type() == PipeType::Serial).then_some(Mutex::new(())))
+            .map(|pipe| (pipe.pipe_type() == PipeType::Serial).then_some(SpinLock::new()))
             .collect(),
         runtime.cancelled_flag(),
     ));
@@ -652,11 +694,10 @@ fn run_pipe_line(
         };
 
         {
-            let _stage_guard = lock_unpoisoned(
-                run_state.stage_locks[0]
-                    .as_ref()
-                    .expect("the first pipe must be serial"),
-            );
+            let _stage_guard = run_state.stage_locks[0]
+                .as_ref()
+                .expect("the first pipe must be serial")
+                .lock();
 
             if run_state.should_stop() {
                 return Ok(());
@@ -681,7 +722,7 @@ fn run_pipe_line(
         for pipe_index in 1..pipes.len() {
             context.pipe = pipe_index;
             if let Some(stage_lock) = &run_state.stage_locks[pipe_index] {
-                let _stage_guard = lock_unpoisoned(stage_lock);
+                let _stage_guard = stage_lock.lock();
                 pipes[pipe_index].run(&mut context);
             } else {
                 pipes[pipe_index].run(&mut context);
@@ -700,7 +741,7 @@ fn run_data_chain(
     let run_state = Arc::new(PipelineRunState::new(
         stages
             .iter()
-            .map(|stage| (stage.pipe_type() == PipeType::Serial).then_some(Mutex::new(())))
+            .map(|stage| (stage.pipe_type() == PipeType::Serial).then_some(SpinLock::new()))
             .collect(),
         runtime.cancelled_flag(),
     ));
@@ -751,11 +792,10 @@ fn run_data_line(
             stop_requested: false,
         };
         {
-            let _stage_guard = lock_unpoisoned(
-                run_state.stage_locks[0]
-                    .as_ref()
-                    .expect("the first pipe must be serial"),
-            );
+            let _stage_guard = run_state.stage_locks[0]
+                .as_ref()
+                .expect("the first pipe must be serial")
+                .lock();
 
             if run_state.should_stop() {
                 return Ok(());
@@ -780,7 +820,7 @@ fn run_data_line(
         for pipe_index in 1..stages.len() {
             context.pipe = pipe_index;
             if let Some(stage_lock) = &run_state.stage_locks[pipe_index] {
-                let _stage_guard = lock_unpoisoned(stage_lock);
+                let _stage_guard = stage_lock.lock();
                 stages[pipe_index].run(line, &mut context);
             } else {
                 stages[pipe_index].run(line, &mut context);
