@@ -3,14 +3,16 @@ use std::cmp::Ordering;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
 
-use flow_core::{AsyncHandle, Executor, FlowError};
+use flow_core::{AsyncHandle, Executor, FlowError, RuntimeCtx};
 
 use crate::parallel_for::{
     ParallelForOptions, chunk_ranges_for_workers,
 };
 
 const SCAN_SEQUENTIAL_CUTOFF_PER_WORKER: usize = 2_048;
-const SORT_SEQUENTIAL_CUTOFF_PER_WORKER: usize = 2_048;
+const SORT_SEQUENTIAL_CUTOFF_PER_WORKER: usize = 32_768;
+const SORT_INSERTION_SORT_THRESHOLD: usize = 24;
+const SORT_PARTIAL_INSERTION_SORT_LIMIT: usize = 8;
 
 /// Thread-safe wrapper for UnsafeCell buffer where each worker has exclusive access to its chunk.
 struct ScanBuffer<T> {
@@ -381,34 +383,33 @@ where
         return Ok(input);
     }
 
+    let workers = executor.num_workers().max(1);
     let sequential_cutoff = options
-        .resolve_chunk_size_for_workers(input.len(), executor.num_workers())
-        .max(executor.num_workers().max(1) * SORT_SEQUENTIAL_CUTOFF_PER_WORKER);
+        .resolve_chunk_size_for_workers(input.len(), workers)
+        .max(workers * SORT_SEQUENTIAL_CUTOFF_PER_WORKER);
 
-    if input.len() <= sequential_cutoff {
+    if workers <= 1 || input.len() <= sequential_cutoff {
         let mut input = input;
         input.sort_unstable_by(|left, right| compare(left, right));
         return Ok(input);
     }
 
-    let compare = Arc::new(compare);
+    let is_less = Arc::new(move |left: &T, right: &T| compare(left, right) == Ordering::Less);
     let len = input.len();
+    let bad_partition_budget = initial_sort_bad_partition_budget(len);
     let mut input = input;
     let data = SharedMutPtr::from_slice(input.as_mut_slice());
-    let root_executor = executor.clone();
 
     executor
-        .async_task(move || -> Result<(), FlowError> {
-            unsafe {
-                parallel_partition_sort(
-                    root_executor,
-                    data,
-                    0,
-                    len,
-                    compare,
-                    sequential_cutoff,
-                )
-            }
+        .runtime_async(move |runtime| unsafe {
+            parallel_sort_entry(
+                runtime,
+                data,
+                len,
+                is_less,
+                sequential_cutoff,
+                bad_partition_budget,
+            )
         })
         .wait()??;
 
@@ -452,52 +453,230 @@ where
     output
 }
 
-unsafe fn parallel_partition_sort<T, F>(
-    executor: Executor,
+fn ordering_from_is_less<T, F>(is_less: &F, left: &T, right: &T) -> Ordering
+where
+    F: Fn(&T, &T) -> bool + ?Sized,
+{
+    if is_less(left, right) {
+        Ordering::Less
+    } else if is_less(right, left) {
+        Ordering::Greater
+    } else {
+        Ordering::Equal
+    }
+}
+
+fn initial_sort_bad_partition_budget(len: usize) -> usize {
+    len.checked_ilog2().unwrap_or(0) as usize * 2
+}
+
+fn insertion_sort_by_less<T, F>(slice: &mut [T], is_less: &F)
+where
+    F: Fn(&T, &T) -> bool + ?Sized,
+{
+    for index in 1..slice.len() {
+        let mut current = index;
+        while current > 0 && is_less(&slice[current], &slice[current - 1]) {
+            slice.swap(current, current - 1);
+            current -= 1;
+        }
+    }
+}
+
+#[allow(dead_code)]
+fn partial_insertion_sort_by_less<T, F>(slice: &mut [T], is_less: &F) -> bool
+where
+    F: Fn(&T, &T) -> bool + ?Sized,
+{
+    let mut moves = 0usize;
+
+    for index in 1..slice.len() {
+        if !is_less(&slice[index], &slice[index - 1]) {
+            continue;
+        }
+
+        let mut current = index;
+        while current > 0 && is_less(&slice[current], &slice[current - 1]) {
+            slice.swap(current, current - 1);
+            current -= 1;
+            moves += 1;
+            if moves > SORT_PARTIAL_INSERTION_SORT_LIMIT {
+                return false;
+            }
+        }
+    }
+
+    true
+}
+
+fn sift_down_by_less<T, F>(slice: &mut [T], mut root: usize, end: usize, is_less: &F)
+where
+    F: Fn(&T, &T) -> bool + ?Sized,
+{
+    loop {
+        let left_child = root.saturating_mul(2).saturating_add(1);
+        if left_child >= end {
+            return;
+        }
+
+        let mut child = left_child;
+        let right_child = left_child + 1;
+        if right_child < end && is_less(&slice[child], &slice[right_child]) {
+            child = right_child;
+        }
+
+        if !is_less(&slice[root], &slice[child]) {
+            return;
+        }
+
+        slice.swap(root, child);
+        root = child;
+    }
+}
+
+#[allow(dead_code)]
+fn heapsort_by_less<T, F>(slice: &mut [T], is_less: &F)
+where
+    F: Fn(&T, &T) -> bool + ?Sized,
+{
+    if slice.len() < 2 {
+        return;
+    }
+
+    for start in (0..=(slice.len() - 2) / 2).rev() {
+        sift_down_by_less(slice, start, slice.len(), is_less);
+    }
+
+    for end in (1..slice.len()).rev() {
+        slice.swap(0, end);
+        sift_down_by_less(slice, 0, end, is_less);
+    }
+}
+
+fn sort_slice_by_less<T, F>(slice: &mut [T], is_less: &F)
+where
+    F: Fn(&T, &T) -> bool + ?Sized,
+{
+    if slice.len() < SORT_INSERTION_SORT_THRESHOLD {
+        insertion_sort_by_less(slice, is_less);
+    } else {
+        slice.sort_unstable_by(|left, right| ordering_from_is_less(is_less, left, right));
+    }
+}
+
+unsafe fn parallel_sort_entry<T, F>(
+    runtime: &RuntimeCtx,
     data: SharedMutPtr<T>,
-    begin: usize,
-    end: usize,
-    compare: Arc<F>,
+    len: usize,
+    is_less: Arc<F>,
     sequential_cutoff: usize,
+    bad_partition_budget: usize,
 ) -> Result<(), FlowError>
 where
     T: Send + 'static,
-    F: Fn(&T, &T) -> Ordering + Send + Sync + 'static,
+    F: Fn(&T, &T) -> bool + Send + Sync + 'static,
 {
-    let len = end - begin;
-    if len <= 1 {
-        return Ok(());
-    }
-
-    if len <= sequential_cutoff {
-        let slice = unsafe { std::slice::from_raw_parts_mut(data.0.add(begin), len) };
-        slice.sort_unstable_by(|left, right| compare(left, right));
-        return Ok(());
-    }
-
-    let mid = len / 2;
-    let slice = unsafe { std::slice::from_raw_parts_mut(data.0.add(begin), len) };
-    slice.select_nth_unstable_by(mid, |left, right| compare(left, right));
-
-    let pivot = begin + mid;
-    let tg = executor.task_group();
-    let right_executor = executor.clone();
-    let right_compare = Arc::clone(&compare);
-
-    tg.silent_async(move || unsafe {
-        parallel_partition_sort(
-            right_executor,
+    unsafe {
+        parallel_quicksort(
+            runtime,
             data,
-            pivot + 1,
-            end,
-            right_compare,
+            0,
+            len,
+            is_less,
             sequential_cutoff,
+            bad_partition_budget,
         )
-        .expect("parallel sort right partition should succeed");
-    });
+    }
+}
 
-    unsafe { parallel_partition_sort(executor, data, begin, pivot, compare, sequential_cutoff)? };
-    tg.corun()
+unsafe fn parallel_quicksort<T, F>(
+    runtime: &RuntimeCtx,
+    data: SharedMutPtr<T>,
+    mut begin: usize,
+    mut end: usize,
+    is_less: Arc<F>,
+    sequential_cutoff: usize,
+    bad_partition_budget: usize,
+) -> Result<(), FlowError>
+where
+    T: Send + 'static,
+    F: Fn(&T, &T) -> bool + Send + Sync + 'static,
+{
+    let _bad_partition_budget = bad_partition_budget;
+
+    loop {
+        let len = end - begin;
+        if len <= 1 {
+            break;
+        }
+
+        if len <= sequential_cutoff {
+            let slice = unsafe { std::slice::from_raw_parts_mut(data.0.add(begin), len) };
+            sort_slice_by_less(slice, is_less.as_ref());
+            break;
+        }
+
+        let mid = len / 2;
+        let slice = unsafe { std::slice::from_raw_parts_mut(data.0.add(begin), len) };
+        slice.select_nth_unstable_by(mid, |left, right| {
+            ordering_from_is_less(is_less.as_ref(), left, right)
+        });
+
+        let pivot = begin + mid;
+        let left_begin = begin;
+        let left_end = pivot;
+        let right_begin = pivot + 1;
+        let right_end = end;
+        let left_len = left_end.saturating_sub(left_begin);
+        let right_len = right_end.saturating_sub(right_begin);
+
+        if left_len <= sequential_cutoff && right_len <= sequential_cutoff {
+            if left_len > 1 {
+                let left =
+                    unsafe { std::slice::from_raw_parts_mut(data.0.add(left_begin), left_len) };
+                sort_slice_by_less(left, is_less.as_ref());
+            }
+            if right_len > 1 {
+                let right =
+                    unsafe { std::slice::from_raw_parts_mut(data.0.add(right_begin), right_len) };
+                sort_slice_by_less(right, is_less.as_ref());
+            }
+            break;
+        }
+
+        let (spawn_begin, spawn_end, inline_begin, inline_end) = if left_len <= right_len {
+            (left_begin, left_end, right_begin, right_end)
+        } else {
+            (right_begin, right_end, left_begin, left_end)
+        };
+        let spawn_len = spawn_end.saturating_sub(spawn_begin);
+        let inline_len = inline_end.saturating_sub(inline_begin);
+
+        if spawn_len > 1 {
+            let spawned_is_less = Arc::clone(&is_less);
+            runtime.silent_async(move |runtime| unsafe {
+                parallel_quicksort(
+                    runtime,
+                    data,
+                    spawn_begin,
+                    spawn_end,
+                    spawned_is_less,
+                    sequential_cutoff,
+                    bad_partition_budget,
+                )
+                .expect("parallel sort runtime child should succeed");
+            });
+        }
+
+        if inline_len <= 1 {
+            break;
+        }
+
+        begin = inline_begin;
+        end = inline_end;
+    }
+
+    runtime.corun_children()
 }
 
 fn wait_all<T>(handles: Vec<AsyncHandle<T>>) -> Result<Vec<T>, FlowError> {

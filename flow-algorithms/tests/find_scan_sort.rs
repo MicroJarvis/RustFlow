@@ -4,6 +4,44 @@ use flow_algorithms::{
     Executor, ParallelForOptions, parallel_exclusive_scan, parallel_find, parallel_inclusive_scan,
     parallel_sort, parallel_sort_by,
 };
+use rayon::slice::ParallelSliceMut;
+
+const PARALLEL_SORT_TEST_LEN: usize = 200_000;
+
+fn assert_parallel_sort_matches_oracles(input: Vec<i32>, options: ParallelForOptions) {
+    let executor = Executor::new(4);
+    let mut expected_std = input.clone();
+    expected_std.sort_unstable();
+
+    let mut expected_rayon = input.clone();
+    expected_rayon.par_sort_unstable();
+
+    let output = parallel_sort(&executor, input, options).expect("parallel sort should succeed");
+
+    assert_eq!(output, expected_std);
+    assert_eq!(output, expected_rayon);
+}
+
+fn assert_parallel_sort_by_matches_oracles<F>(
+    input: Vec<i32>,
+    options: ParallelForOptions,
+    compare: F,
+) where
+    F: Fn(&i32, &i32) -> std::cmp::Ordering + Send + Sync + Copy + 'static,
+{
+    let executor = Executor::new(4);
+    let mut expected_std = input.clone();
+    expected_std.sort_unstable_by(compare);
+
+    let mut expected_rayon = input.clone();
+    expected_rayon.par_sort_unstable_by(compare);
+
+    let output =
+        parallel_sort_by(&executor, input, options, compare).expect("parallel sort by should succeed");
+
+    assert_eq!(output, expected_std);
+    assert_eq!(output, expected_rayon);
+}
 
 #[test]
 fn parallel_find_returns_first_matching_index() {
@@ -194,4 +232,65 @@ fn parallel_sort_large_matches_std_sort() {
     .expect("large parallel sort should succeed");
 
     assert_eq!(output, expected);
+}
+
+#[test]
+fn parallel_sort_preserves_sorted_input_on_parallel_path() {
+    let input = (0..PARALLEL_SORT_TEST_LEN as i32).collect::<Vec<_>>();
+    assert_parallel_sort_matches_oracles(input, ParallelForOptions::default());
+}
+
+#[test]
+fn parallel_sort_handles_reverse_sorted_input_on_parallel_path() {
+    let input = (0..PARALLEL_SORT_TEST_LEN as i32)
+        .rev()
+        .collect::<Vec<_>>();
+    assert_parallel_sort_matches_oracles(input, ParallelForOptions::default());
+}
+
+#[test]
+fn parallel_sort_handles_duplicate_heavy_input_on_parallel_path() {
+    let input = (0..PARALLEL_SORT_TEST_LEN)
+        .map(|index| (index % 11) as i32 - 5)
+        .collect::<Vec<_>>();
+    assert_parallel_sort_matches_oracles(input, ParallelForOptions::default());
+}
+
+#[test]
+fn parallel_sort_handles_all_equal_input_on_parallel_path() {
+    let input = vec![42; PARALLEL_SORT_TEST_LEN];
+    assert_parallel_sort_matches_oracles(input, ParallelForOptions::default());
+}
+
+#[test]
+fn parallel_sort_handles_nearly_sorted_input_on_parallel_path() {
+    let mut input = (0..PARALLEL_SORT_TEST_LEN as i32).collect::<Vec<_>>();
+    for offset in (0..PARALLEL_SORT_TEST_LEN.saturating_sub(17)).step_by(4096) {
+        input.swap(offset, offset + 17);
+    }
+    assert_parallel_sort_matches_oracles(input, ParallelForOptions::default());
+}
+
+#[test]
+fn parallel_sort_by_matches_descending_oracles_on_parallel_path() {
+    let input = (0..PARALLEL_SORT_TEST_LEN)
+        .map(|index| ((index as i32 * 37) % 10_007) - 5_000)
+        .collect::<Vec<_>>();
+    assert_parallel_sort_by_matches_oracles(
+        input,
+        ParallelForOptions::default(),
+        |left, right| right.cmp(left),
+    );
+}
+
+#[test]
+fn parallel_sort_by_matches_descending_oracles_for_duplicate_heavy_input() {
+    let input = (0..PARALLEL_SORT_TEST_LEN)
+        .map(|index| (index % 9) as i32)
+        .collect::<Vec<_>>();
+    assert_parallel_sort_by_matches_oracles(
+        input,
+        ParallelForOptions::default(),
+        |left, right| right.cmp(left),
+    );
 }

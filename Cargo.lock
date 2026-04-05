@@ -46,6 +46,7 @@ name = "flow-algorithms"
 version = "0.1.0"
 dependencies = [
  "flow-core",
+ "rayon",
 ]
 
 [[package]]

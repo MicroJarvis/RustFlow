@@ -9,3 +9,6 @@ path = "src/lib.rs"
 
 [dependencies]
 flow-core = { path = "../flow-core" }
+
+[dev-dependencies]
+rayon = "1.11.0"
