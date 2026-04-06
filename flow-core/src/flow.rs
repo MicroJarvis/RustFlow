@@ -251,6 +251,7 @@ pub(crate) struct NodeSnapshot {
 pub(crate) struct GraphSnapshot {
     pub(crate) nodes: Vec<NodeSnapshot>,
     pub(crate) roots: Vec<usize>,
+    pub(crate) initial_pending: Vec<usize>,
 }
 
 struct Node {
@@ -290,7 +291,7 @@ fn add_edge(graph: &mut Graph, from: TaskId, to: TaskId) {
 }
 
 fn snapshot_graph(graph: &Graph) -> GraphSnapshot {
-    let nodes = graph
+    let nodes: Vec<_> = graph
         .nodes
         .iter()
         .enumerate()
@@ -316,7 +317,13 @@ fn snapshot_graph(graph: &Graph) -> GraphSnapshot {
         .filter_map(|(index, node)| node.predecessors.is_empty().then_some(index))
         .collect();
 
-    GraphSnapshot { nodes, roots }
+    let initial_pending = nodes.iter().map(|node| node.predecessor_count).collect();
+
+    GraphSnapshot {
+        nodes,
+        roots,
+        initial_pending,
+    }
 }
 
 struct FlowInner {

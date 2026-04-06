@@ -304,6 +304,59 @@ fn executor_task_group_can_wait_from_an_external_thread() {
 }
 
 #[test]
+fn executor_task_group_corun_is_a_noop_without_children() {
+    let executor = Executor::new(2);
+    let tg = executor.task_group();
+
+    assert_eq!(tg.size(), 0);
+    tg.corun()
+        .expect("empty task-group corun should succeed immediately");
+    assert_eq!(tg.size(), 0);
+}
+
+#[test]
+fn executor_task_group_cancel_before_spawn_skips_children() {
+    let executor = Executor::new(2);
+    let tg = executor.task_group();
+    let hits = Arc::new(AtomicUsize::new(0));
+
+    tg.cancel();
+    assert!(tg.is_cancelled());
+
+    {
+        let hits = Arc::clone(&hits);
+        tg.silent_async(move || {
+            hits.fetch_add(1, Ordering::SeqCst);
+        });
+    }
+
+    tg.corun()
+        .expect("cancelled task-group corun should still complete cleanly");
+
+    assert_eq!(tg.size(), 0);
+    assert_eq!(hits.load(Ordering::SeqCst), 0);
+}
+
+#[test]
+fn executor_task_group_is_tracked_by_wait_for_all_without_corun() {
+    let executor = Executor::new(2);
+    let tg = executor.task_group();
+    let hits = Arc::new(AtomicUsize::new(0));
+
+    for _ in 0..4 {
+        let hits = Arc::clone(&hits);
+        tg.silent_async(move || {
+            std::thread::sleep(std::time::Duration::from_millis(10));
+            hits.fetch_add(1, Ordering::SeqCst);
+        });
+    }
+
+    executor.wait_for_all();
+
+    assert_eq!(hits.load(Ordering::SeqCst), 4);
+}
+
+#[test]
 fn runtime_wait_async_surfaces_child_panics() {
     let executor = Executor::new(1);
     let flow = Flow::new();
@@ -429,6 +482,35 @@ fn runtime_corun_children_waits_for_all_silent_children() {
         .run(&flow)
         .wait()
         .expect("parent runtime flow should succeed");
+
+    assert_eq!(hits.load(Ordering::SeqCst), 4);
+}
+
+#[test]
+fn runtime_silent_children_are_tracked_by_wait_for_all_without_corun() {
+    let executor = Executor::new(1);
+    let flow = Flow::new();
+    let hits = Arc::new(AtomicUsize::new(0));
+
+    {
+        let hits = Arc::clone(&hits);
+        flow.spawn_runtime(move |runtime| {
+            for _ in 0..4 {
+                let hits = Arc::clone(&hits);
+                runtime.silent_async(move |_| {
+                    std::thread::sleep(std::time::Duration::from_millis(10));
+                    hits.fetch_add(1, Ordering::SeqCst);
+                });
+            }
+        });
+    }
+
+    executor
+        .run(&flow)
+        .wait()
+        .expect("parent runtime flow should complete");
+
+    executor.wait_for_all();
 
     assert_eq!(hits.load(Ordering::SeqCst), 4);
 }

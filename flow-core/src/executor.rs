@@ -1,6 +1,5 @@
 use std::any::Any;
 use std::cell::RefCell;
-use std::collections::VecDeque;
 use std::panic::{self, AssertUnwindSafe};
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU32, AtomicUsize, Ordering, fence};
 use std::sync::{Arc, Condvar, Mutex, OnceLock, RwLock};
@@ -13,7 +12,7 @@ use crate::error::FlowError;
 use crate::flow::{Flow, GraphSnapshot, NodeSnapshot, Subflow, TaskId, TaskKind};
 use crate::observer::Observer;
 use crate::runtime::{RuntimeCtx, RuntimeJoinScope};
-use crate::task_group::TaskGroup;
+use crate::task_group::{TaskGroup, TaskGroupState};
 use crate::util::WaitBackoff;
 
 const WORKER_STACK_SIZE: usize = 16 * 1024 * 1024;
@@ -23,7 +22,31 @@ struct RuntimeSpawnContext {
     executor: Arc<ExecutorInner>,
     worker_id: usize,
     cancelled: Arc<AtomicBool>,
-    join_scope: Arc<RuntimeJoinScope>,
+    // SAFETY: This points to the active RuntimeCtx.join_scope OnceLock for the
+    // duration of the installed runtime spawn context guard.
+    join_scope: *const OnceLock<Arc<RuntimeJoinScope>>,
+}
+
+impl RuntimeSpawnContext {
+    fn new(
+        executor: Arc<ExecutorInner>,
+        worker_id: usize,
+        cancelled: Arc<AtomicBool>,
+        join_scope: *const OnceLock<Arc<RuntimeJoinScope>>,
+    ) -> Self {
+        Self {
+            executor,
+            worker_id,
+            cancelled,
+            join_scope,
+        }
+    }
+
+    fn ensure_join_scope(&self) -> Arc<RuntimeJoinScope> {
+        // SAFETY: `join_scope` points to the active RuntimeCtx held alive by the
+        // scope guard installed around runtime task execution.
+        unsafe { Arc::clone((&*self.join_scope).get_or_init(RuntimeJoinScope::default_arc)) }
+    }
 }
 
 thread_local! {
@@ -194,6 +217,7 @@ impl Executor {
             run_completion: RunCompletionEvent::default(),
             worker_count,
             active_runs: AtomicUsize::new(0),
+            live_run_states: Mutex::new(Vec::new()),
             shutdown: AtomicBool::new(false),
             threads: Mutex::new(Vec::with_capacity(worker_count)),
             observers: RwLock::new(Vec::new()),
@@ -404,9 +428,7 @@ impl Executor {
             context
                 .as_ref()
                 .map(|context| Arc::clone(&context.cancelled)),
-            context
-                .as_ref()
-                .map(|context| Arc::clone(&context.join_scope)),
+            context.as_ref().map(RuntimeSpawnContext::ensure_join_scope),
         )
     }
 
@@ -473,10 +495,20 @@ impl Executor {
         run.outstanding
             .fetch_add(root_indices.len(), Ordering::AcqRel);
 
+        let run_ptr: *const RunState = &*run;
+
+        // Store Arc to keep RunState alive for the duration of this run.
+        // It will be removed in finish_task when outstanding reaches 0.
+        self.inner
+            .live_run_states
+            .lock()
+            .expect("live_run_states poisoned")
+            .push(run);
+
         let scheduled_roots = root_indices
             .into_iter()
             .map(|task_index| ScheduledTask {
-                run: Arc::clone(&run),
+                run: run_ptr,
                 task_index,
             })
             .collect();
@@ -501,10 +533,28 @@ impl Executor {
         runtime_cancelled: Arc<AtomicBool>,
         join_scope: Arc<RuntimeJoinScope>,
     ) {
-        join_scope.add_child();
+        let _ = join_scope.add_child();
         self.inner.increment_active_runs();
         self.inner.enqueue_async(
             ScheduledAsyncTask::runtime_child(runner, runtime_cancelled, join_scope),
+            worker_hint,
+        );
+    }
+
+    pub(crate) fn schedule_task_group_child(
+        &self,
+        runner: Box<dyn FnOnce() + Send + 'static>,
+        worker_hint: Option<usize>,
+        state: Arc<TaskGroupState>,
+    ) {
+        if state.add_child() {
+            self.inner.increment_active_runs();
+        }
+        self.inner.enqueue_task_group(
+            ScheduledTaskGroupChild {
+                runner: Some(runner),
+                state,
+            },
             worker_hint,
         );
     }
@@ -517,11 +567,7 @@ impl Executor {
     }
 
     fn current_worker_id(&self) -> Option<usize> {
-        WORKER_LOCAL.with(|slot| {
-            slot.borrow()
-                .as_ref()
-                .map(|local| local.worker_id)
-        })
+        WORKER_LOCAL.with(|slot| slot.borrow().as_ref().map(|local| local.worker_id))
     }
 
     fn schedule_async_runner_with_runtime_cancelled(
@@ -548,6 +594,27 @@ impl Executor {
     where
         F: FnMut() -> bool,
     {
+        // Resolve the worker reference once to avoid repeated TLS lookups.
+        // SAFETY: The Worker lives in WORKER_LOCAL (thread-local storage) for the
+        // entire worker thread lifetime. drive_worker_until is only called from
+        // worker_loop or wait_until_inline (which runs on a worker thread).
+        // The TLS is only cleared when WorkerLocalGuard drops after worker_loop returns.
+        let worker_ptr: Option<*const Worker<ScheduledWork>> = WORKER_LOCAL.with(|slot| {
+            slot.borrow()
+                .as_ref()
+                .map(|local| &local.worker as *const _)
+        });
+
+        let find_task = |inner: &ExecutorInner| {
+            if let Some(w) = worker_ptr {
+                // SAFETY: See above — pointer is valid for the duration of this function.
+                let worker = unsafe { &*w };
+                inner.next_task_with_worker(worker_id, worker)
+            } else {
+                inner.next_task(worker_id)
+            }
+        };
+
         let mut continuation = None;
         let mut steal_attempts = 0usize;
         const MAX_STEAL_ATTEMPTS: usize = 64;
@@ -557,9 +624,7 @@ impl Executor {
                 return;
             }
 
-            let task = continuation
-                .take()
-                .or_else(|| self.inner.next_task(worker_id));
+            let task = continuation.take().or_else(|| find_task(&self.inner));
             if let Some(task) = task {
                 steal_attempts = 0;
                 continuation = self.inner.execute(self, worker_id, task);
@@ -575,7 +640,7 @@ impl Executor {
                         return;
                     }
 
-                    let task = self.inner.next_task(worker_id);
+                    let task = find_task(&self.inner);
                     if let Some(task) = task {
                         self.inner.cancel_park(worker_id, observed_epoch);
                         continuation = self.inner.execute(self, worker_id, task);
@@ -609,7 +674,7 @@ impl Drop for Executor {
             return;
         }
 
-        self.inner.shutdown.store(true, Ordering::SeqCst);
+        self.inner.shutdown.store(true, Ordering::Release);
         self.inner.wake_all_workers();
         self.inner.run_completion.notify_all();
 
@@ -702,6 +767,9 @@ struct ExecutorInner {
     run_completion: RunCompletionEvent,
     worker_count: usize,
     active_runs: AtomicUsize,
+    /// Keeps RunState allocations alive while tasks reference them via raw pointers.
+    /// Only accessed at run start (push) and run completion (remove).
+    live_run_states: Mutex<Vec<Arc<RunState>>>,
     shutdown: AtomicBool,
     threads: Mutex<Vec<JoinHandle<()>>>,
     observers: RwLock<Vec<Arc<dyn Observer>>>,
@@ -805,7 +873,7 @@ impl ExecutorInner {
 
     fn wake_worker(&self, worker_id: usize) -> bool {
         let parker = &self.parkers[worker_id];
-        let state = parker.state.load(Ordering::Acquire);
+        let state = parker.state.load(Ordering::SeqCst);
         if state != WORKER_PREPARING && state != WORKER_PARKED {
             return false;
         }
@@ -818,14 +886,14 @@ impl ExecutorInner {
     }
 
     fn wake_all_workers(&self) {
-        fence(Ordering::SeqCst);
+        fence(Ordering::Release);
         for worker_id in 0..self.parkers.len() {
             let _ = self.wake_worker(worker_id);
         }
     }
 
     fn schedule(&self, task: ScheduledTask, worker_hint: Option<usize>) {
-        task.run.outstanding.fetch_add(1, Ordering::AcqRel);
+        task.run_state().outstanding.fetch_add(1, Ordering::AcqRel);
         self.enqueue_graph(task, worker_hint);
     }
 
@@ -842,7 +910,7 @@ impl ExecutorInner {
         task: ScheduledTask,
         worker_hint: Option<usize>,
     ) {
-        task.run.outstanding.fetch_add(1, Ordering::AcqRel);
+        task.run_state().outstanding.fetch_add(1, Ordering::AcqRel);
         if continuation.is_none() {
             *continuation = Some(ScheduledWork::Graph(task));
         } else {
@@ -856,6 +924,10 @@ impl ExecutorInner {
 
     fn enqueue_async(&self, task: ScheduledAsyncTask, worker_hint: Option<usize>) {
         self.enqueue(ScheduledWork::Async(task), worker_hint);
+    }
+
+    fn enqueue_task_group(&self, task: ScheduledTaskGroupChild, worker_hint: Option<usize>) {
+        self.enqueue(ScheduledWork::TaskGroup(task), worker_hint);
     }
 
     fn enqueue(&self, task: ScheduledWork, worker_hint: Option<usize>) {
@@ -878,9 +950,11 @@ impl ExecutorInner {
         // If not pushed locally, push to injector
         if let Some(task) = task_opt {
             self.injector.push(task);
-            fence(Ordering::SeqCst);
 
             // Wake a worker to process the task
+            // Note: wake_worker uses SeqCst load on parker state, which together
+            // with prepare_park's SeqCst fence provides the Dekker-pattern
+            // synchronization needed to prevent missed wakeups.
             if let Some(target) = worker_hint {
                 let _ = self.wake_worker(target);
             } else {
@@ -919,9 +993,8 @@ impl ExecutorInner {
             for task in tasks {
                 self.injector.push(task);
             }
-            fence(Ordering::SeqCst);
 
-            // Wake workers
+            // Wake workers (SeqCst load in wake_worker provides Dekker synchronization)
             if let Some(target) = worker_hint {
                 let _ = self.wake_worker(target);
             } else {
@@ -952,18 +1025,8 @@ impl ExecutorInner {
             let borrowed = slot.borrow();
             let worker = borrowed.as_ref().map(|local| &local.worker);
 
-            // 1. Try local queue first
             if let Some(w) = worker {
-                if let Some(task) = w.pop() {
-                    return Some(task);
-                }
-
-                // 2. Try stealing from injector
-                match self.injector.steal_batch_and_pop(w) {
-                    Steal::Success(task) => return Some(task),
-                    Steal::Retry => {}
-                    Steal::Empty => {}
-                }
+                self.next_task_with_worker(worker_id, w)
             } else {
                 // No local worker, try injector directly
                 loop {
@@ -973,32 +1036,54 @@ impl ExecutorInner {
                         Steal::Empty => break,
                     }
                 }
+                self.steal_from_others(worker_id)
             }
-
-            // 3. Try stealing from other workers (lock-free via Arc)
-            let stealers = &self.stealers;
-            let num_stealers = stealers.len();
-            if num_stealers == 0 {
-                return None;
-            }
-
-            // Start from a random position to avoid all workers targeting the same victim
-            let start = (worker_id + 1) % num_stealers;
-
-            for offset in 0..num_stealers {
-                let victim = (start + offset) % num_stealers;
-                if victim == worker_id {
-                    continue;
-                }
-                match stealers[victim].steal() {
-                    Steal::Success(task) => return Some(task),
-                    Steal::Retry => continue,
-                    Steal::Empty => continue,
-                }
-            }
-
-            None
         })
+    }
+
+    /// Fast path: find a task with a pre-resolved worker reference, avoiding TLS lookup.
+    fn next_task_with_worker(
+        &self,
+        worker_id: usize,
+        worker: &Worker<ScheduledWork>,
+    ) -> Option<ScheduledWork> {
+        // 1. Try local queue first
+        if let Some(task) = worker.pop() {
+            return Some(task);
+        }
+
+        // 2. Try stealing from injector
+        match self.injector.steal_batch_and_pop(worker) {
+            Steal::Success(task) => return Some(task),
+            Steal::Retry | Steal::Empty => {}
+        }
+
+        // 3. Try stealing from other workers
+        self.steal_from_others(worker_id)
+    }
+
+    fn steal_from_others(&self, worker_id: usize) -> Option<ScheduledWork> {
+        let stealers = &self.stealers;
+        let num_stealers = stealers.len();
+        if num_stealers == 0 {
+            return None;
+        }
+
+        // Start from a rotating position to avoid all workers targeting the same victim
+        let start = (worker_id + 1) % num_stealers;
+
+        for offset in 0..num_stealers {
+            let victim = (start + offset) % num_stealers;
+            if victim == worker_id {
+                continue;
+            }
+            match stealers[victim].steal() {
+                Steal::Success(task) => return Some(task),
+                Steal::Retry | Steal::Empty => continue,
+            }
+        }
+
+        None
     }
 
     fn execute(
@@ -1013,6 +1098,10 @@ impl ExecutorInner {
                 self.execute_async(executor, worker_id, task);
                 None
             }
+            ScheduledWork::TaskGroup(task) => {
+                self.execute_task_group_child(executor, worker_id, task);
+                None
+            }
         }
     }
 
@@ -1022,10 +1111,11 @@ impl ExecutorInner {
         worker_id: usize,
         scheduled: ScheduledTask,
     ) -> Option<ScheduledWork> {
-        let node = &scheduled.run.graph.nodes[scheduled.task_index];
+        let run = scheduled.run_state();
+        let node = &run.graph.nodes[scheduled.task_index];
         let mut continuation = None;
 
-        if scheduled.run.is_cancelled() {
+        if run.is_cancelled() {
             self.finish_task(&scheduled);
             return None;
         }
@@ -1034,12 +1124,14 @@ impl ExecutorInner {
             return None;
         }
 
-        let run = Arc::clone(&scheduled.run);
+        // Transmute pointer to usize to cross the Send boundary in the scheduler closure.
+        // SAFETY: Same invariant as ScheduledTask — RunState is valid for the run's lifetime.
+        let run_addr = scheduled.run as usize;
         let executor_for_scheduler = executor.clone();
         let scheduler = Arc::new(move |task_id: TaskId| {
             executor_for_scheduler.inner.schedule(
                 ScheduledTask {
-                    run: Arc::clone(&run),
+                    run: run_addr as *const RunState,
                     task_index: task_id.index(),
                 },
                 Some(worker_id),
@@ -1052,17 +1144,17 @@ impl ExecutorInner {
             executor,
             worker_id,
             Some(scheduler),
-            Arc::clone(&scheduled.run.cancelled),
+            Arc::clone(&run.cancelled),
         );
         self.notify_task_finished(worker_id, node);
 
         if let Err(error) = &selected_successors {
-            scheduled.run.record_error(error.clone());
+            run.record_error(error.clone());
         }
 
         self.release_all(node, Some(worker_id));
 
-        if scheduled.run.is_cancelled() {
+        if run.is_cancelled() {
             self.finish_task(&scheduled);
             return None;
         }
@@ -1074,7 +1166,7 @@ impl ExecutorInner {
                         self.schedule_ready_graph(
                             &mut continuation,
                             ScheduledTask {
-                                run: Arc::clone(&scheduled.run),
+                                run: scheduled.run,
                                 task_index: successor,
                             },
                             Some(worker_id),
@@ -1084,13 +1176,13 @@ impl ExecutorInner {
             }
         } else if selected_successors.is_ok() {
             for &successor in &node.successors {
-                let previous = scheduled.run.pending[successor].fetch_sub(1, Ordering::AcqRel);
+                let previous = run.pending[successor].fetch_sub(1, Ordering::AcqRel);
                 debug_assert!(previous > 0, "successor pending count underflow");
                 if previous == 1 {
                     self.schedule_ready_graph(
                         &mut continuation,
                         ScheduledTask {
-                            run: Arc::clone(&scheduled.run),
+                            run: scheduled.run,
                             task_index: successor,
                         },
                         Some(worker_id),
@@ -1119,7 +1211,7 @@ impl ExecutorInner {
                 on_success();
             }
             if let Some(join_scope) = join_scope {
-                join_scope.finish_child(Ok(()));
+                let _ = join_scope.finish_child(Ok(()));
             }
             self.decrement_active_runs();
             return;
@@ -1129,20 +1221,18 @@ impl ExecutorInner {
             .runner
             .take()
             .expect("async runner scheduled more than once");
-        let runtime_join_scope = Arc::new(RuntimeJoinScope::default());
         let runtime = RuntimeCtx::new(
             executor.clone(),
             worker_id,
             None,
             Arc::clone(&scheduled.runtime_cancelled),
-            Arc::clone(&runtime_join_scope),
         );
-        let _runtime_context = install_runtime_spawn_context(RuntimeSpawnContext {
-            executor: Arc::clone(&executor.inner),
+        let _runtime_context = install_runtime_spawn_context(RuntimeSpawnContext::new(
+            Arc::clone(&executor.inner),
             worker_id,
-            cancelled: Arc::clone(&scheduled.runtime_cancelled),
-            join_scope: runtime_join_scope,
-        });
+            Arc::clone(&scheduled.runtime_cancelled),
+            runtime.join_scope_ptr(),
+        ));
         let result = match panic::catch_unwind(AssertUnwindSafe(|| runner(&runtime))) {
             Ok(result) => result,
             Err(payload) => Err(FlowError::plain(panic_payload_to_string(payload))),
@@ -1166,19 +1256,52 @@ impl ExecutorInner {
             }
         }
         if let Some(join_scope) = join_scope {
-            join_scope.finish_child(completion_result);
+            let _ = join_scope.finish_child(completion_result);
         }
         self.decrement_active_runs();
     }
 
-    fn finish_task(&self, scheduled: &ScheduledTask) {
-        let node = &scheduled.run.graph.nodes[scheduled.task_index];
-        scheduled.run.pending[scheduled.task_index]
-            .store(node.predecessor_count, Ordering::Release);
+    fn execute_task_group_child(
+        &self,
+        _executor: &Executor,
+        _worker_id: usize,
+        mut scheduled: ScheduledTaskGroupChild,
+    ) {
+        if scheduled.state.is_cancelled() {
+            if scheduled.state.finish_child(Ok(())) {
+                self.decrement_active_runs();
+            }
+            return;
+        }
 
-        if scheduled.run.outstanding.fetch_sub(1, Ordering::AcqRel) == 1 {
-            let result = scheduled.run.final_result();
-            scheduled.run.handle.complete(result);
+        let runner = scheduled
+            .runner
+            .take()
+            .expect("task-group runner scheduled more than once");
+        let result = match panic::catch_unwind(AssertUnwindSafe(runner)) {
+            Ok(()) => Ok(()),
+            Err(payload) => Err(FlowError::plain(panic_payload_to_string(payload))),
+        };
+
+        if scheduled.state.finish_child(result) {
+            self.decrement_active_runs();
+        }
+    }
+
+    fn finish_task(&self, scheduled: &ScheduledTask) {
+        let run = scheduled.run_state();
+        let node = &run.graph.nodes[scheduled.task_index];
+        run.pending[scheduled.task_index].store(node.predecessor_count, Ordering::Release);
+
+        if run.outstanding.fetch_sub(1, Ordering::AcqRel) == 1 {
+            let result = run.final_result();
+            run.handle.complete(result);
+            // Remove the Arc<RunState> from live_run_states, dropping it.
+            // At this point no more ScheduledTasks reference this RunState.
+            self.live_run_states
+                .lock()
+                .expect("live_run_states poisoned")
+                .retain(|arc| !std::ptr::eq(&**arc, scheduled.run));
             self.decrement_active_runs();
         }
     }
@@ -1217,15 +1340,38 @@ impl ExecutorInner {
     }
 }
 
-#[derive(Clone)]
+/// Lightweight task handle that avoids Arc ref-counting overhead per task.
+/// The RunState is kept alive by `ExecutorInner::live_run_states` and only
+/// removed when `outstanding` reaches 0 (all tasks for that run have completed).
+#[derive(Clone, Copy)]
 pub(crate) struct ScheduledTask {
-    run: Arc<RunState>,
+    run: *const RunState,
     task_index: usize,
+}
+
+// SAFETY: RunState is Send+Sync. The raw pointer is valid for the lifetime of the run,
+// which is guaranteed by the Arc<RunState> held in ExecutorInner::live_run_states.
+unsafe impl Send for ScheduledTask {}
+unsafe impl Sync for ScheduledTask {}
+
+impl ScheduledTask {
+    /// Access the RunState behind this task's pointer.
+    ///
+    /// # Safety contract
+    /// The caller must ensure this task belongs to a run that is still alive
+    /// (i.e., `outstanding > 0` and the Arc is still in `live_run_states`).
+    /// This is upheld by construction: tasks are only created for active runs,
+    /// and the Arc is only removed when outstanding reaches 0 in `finish_task`.
+    fn run_state(&self) -> &RunState {
+        // SAFETY: see struct-level and method-level safety docs
+        unsafe { &*self.run }
+    }
 }
 
 enum ScheduledWork {
     Graph(ScheduledTask),
     Async(ScheduledAsyncTask),
+    TaskGroup(ScheduledTaskGroupChild),
 }
 
 struct ScheduledAsyncTask {
@@ -1288,6 +1434,11 @@ impl ScheduledAsyncTask {
     }
 }
 
+struct ScheduledTaskGroupChild {
+    runner: Option<Box<dyn FnOnce() + Send + 'static>>,
+    state: Arc<TaskGroupState>,
+}
+
 struct RunState {
     graph: Arc<GraphSnapshot>,
     pending: Vec<AtomicUsize>,
@@ -1300,9 +1451,10 @@ struct RunState {
 impl RunState {
     fn new(graph: Arc<GraphSnapshot>, handle: RunHandle) -> Self {
         let pending = graph
-            .nodes
+            .initial_pending
             .iter()
-            .map(|node| AtomicUsize::new(node.predecessor_count))
+            .copied()
+            .map(AtomicUsize::new)
             .collect();
 
         Self {
@@ -1393,20 +1545,18 @@ fn execute_node_inline(
             )),
         },
         TaskKind::Runtime(task) => {
-            let runtime_join_scope = Arc::new(RuntimeJoinScope::default());
             let runtime = RuntimeCtx::new(
                 executor.clone(),
                 worker_id,
                 scheduler,
                 Arc::clone(&cancelled),
-                Arc::clone(&runtime_join_scope),
             );
-            let _runtime_context = install_runtime_spawn_context(RuntimeSpawnContext {
-                executor: Arc::clone(&executor.inner),
+            let _runtime_context = install_runtime_spawn_context(RuntimeSpawnContext::new(
+                Arc::clone(&executor.inner),
                 worker_id,
                 cancelled,
-                join_scope: runtime_join_scope,
-            });
+                runtime.join_scope_ptr(),
+            ));
             match panic::catch_unwind(AssertUnwindSafe(|| task(&runtime))) {
                 Ok(()) => Ok(None),
                 Err(payload) => Err(FlowError::panic(
@@ -1461,22 +1611,30 @@ fn execute_graph_inline(
     worker_id: usize,
     cancelled: Arc<AtomicBool>,
 ) -> Result<(), FlowError> {
+    const SMALL_INLINE_GRAPH_LIMIT: usize = 32;
+
     if graph.nodes.is_empty() {
         return Ok(());
     }
 
-    let mut pending: Vec<usize> = graph
-        .nodes
-        .iter()
-        .map(|node| node.predecessor_count)
-        .collect();
-    let mut queue: VecDeque<usize> = graph.roots.iter().copied().collect();
+    if graph.nodes.len() <= SMALL_INLINE_GRAPH_LIMIT
+        && graph.nodes.iter().all(|node| !node.kind.is_condition())
+    {
+        return execute_graph_inline_small(graph, executor, worker_id, cancelled);
+    }
+
+    let mut pending = graph.initial_pending.clone();
+    let mut queue = graph.roots.clone();
+    let mut head = 0usize;
     let mut outstanding = queue.len();
 
-    while let Some(task_index) = queue.pop_front() {
+    while head < queue.len() {
+        let task_index = queue[head];
+        head += 1;
         let node = &graph.nodes[task_index];
+        let initial_pending = graph.initial_pending[task_index];
         if cancelled.load(Ordering::Acquire) {
-            pending[task_index] = node.predecessor_count;
+            pending[task_index] = initial_pending;
             outstanding -= 1;
             if outstanding == 0 {
                 break;
@@ -1491,7 +1649,7 @@ fn execute_graph_inline(
         let selected_successors = selected_successors?;
 
         if cancelled.load(Ordering::Acquire) {
-            pending[task_index] = node.predecessor_count;
+            pending[task_index] = initial_pending;
             outstanding -= 1;
             if outstanding == 0 {
                 break;
@@ -1503,7 +1661,7 @@ fn execute_graph_inline(
             if let Some(successors) = selected_successors {
                 for successor_position in successors {
                     if let Some(&successor) = node.successors.get(successor_position) {
-                        queue.push_back(successor);
+                        queue.push(successor);
                         outstanding += 1;
                     }
                 }
@@ -1514,13 +1672,94 @@ fn execute_graph_inline(
                 debug_assert!(previous > 0, "successor pending count underflow");
                 pending[successor] = previous - 1;
                 if previous == 1 {
-                    queue.push_back(successor);
+                    queue.push(successor);
                     outstanding += 1;
                 }
             }
         }
 
-        pending[task_index] = node.predecessor_count;
+        pending[task_index] = initial_pending;
+        outstanding -= 1;
+        if outstanding == 0 {
+            break;
+        }
+    }
+
+    Ok(())
+}
+
+fn execute_graph_inline_small(
+    graph: &GraphSnapshot,
+    executor: &Executor,
+    worker_id: usize,
+    cancelled: Arc<AtomicBool>,
+) -> Result<(), FlowError> {
+    const SMALL_INLINE_GRAPH_LIMIT: usize = 32;
+
+    let mut pending = [0usize; SMALL_INLINE_GRAPH_LIMIT];
+    let mut queue = [0usize; SMALL_INLINE_GRAPH_LIMIT];
+    let node_count = graph.nodes.len();
+    let root_count = graph.roots.len();
+
+    pending[..node_count].copy_from_slice(&graph.initial_pending);
+    queue[..root_count].copy_from_slice(&graph.roots);
+
+    let mut head = 0usize;
+    let mut tail = root_count;
+    let mut outstanding = root_count;
+
+    while head < tail {
+        let task_index = queue[head];
+        head += 1;
+
+        let node = &graph.nodes[task_index];
+        let initial_pending = graph.initial_pending[task_index];
+
+        if cancelled.load(Ordering::Acquire) {
+            pending[task_index] = initial_pending;
+            outstanding -= 1;
+            if outstanding == 0 {
+                break;
+            }
+            continue;
+        }
+
+        executor.inner.notify_task_started(worker_id, node);
+        let selected_successors =
+            execute_node_inline(node, executor, worker_id, None, Arc::clone(&cancelled));
+        executor.inner.notify_task_finished(worker_id, node);
+        let selected_successors = selected_successors?;
+
+        debug_assert!(
+            selected_successors.is_none(),
+            "small inline DAG path should not execute condition nodes"
+        );
+
+        if cancelled.load(Ordering::Acquire) {
+            pending[task_index] = initial_pending;
+            outstanding -= 1;
+            if outstanding == 0 {
+                break;
+            }
+            continue;
+        }
+
+        for &successor in &node.successors {
+            let previous = pending[successor];
+            debug_assert!(previous > 0, "successor pending count underflow");
+            pending[successor] = previous - 1;
+            if previous == 1 {
+                debug_assert!(
+                    tail < SMALL_INLINE_GRAPH_LIMIT,
+                    "small inline DAG queue overflowed unexpectedly"
+                );
+                queue[tail] = successor;
+                tail += 1;
+                outstanding += 1;
+            }
+        }
+
+        pending[task_index] = initial_pending;
         outstanding -= 1;
         if outstanding == 0 {
             break;

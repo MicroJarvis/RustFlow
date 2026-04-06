@@ -1,5 +1,5 @@
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::{Arc, OnceLock};
 
 use crate::async_handle::{AsyncHandle, RuntimeAsyncState};
 use crate::error::FlowError;
@@ -29,12 +29,16 @@ impl Default for RuntimeJoinScope {
 }
 
 impl RuntimeJoinScope {
-    pub(crate) fn add_child(&self) {
-        self.pending_children.fetch_add(1, Ordering::AcqRel);
+    pub(crate) fn default_arc() -> Arc<Self> {
+        Arc::new(Self::default())
+    }
+
+    pub(crate) fn add_child(&self) -> bool {
+        self.pending_children.fetch_add(1, Ordering::AcqRel) == 0
     }
 
     /// Complete a child task. Uses only atomic operations - no mutex.
-    pub(crate) fn finish_child(&self, result: Result<(), FlowError>) {
+    pub(crate) fn finish_child(&self, result: Result<(), FlowError>) -> bool {
         if result.is_err() {
             // Only set the flag, don't store the actual error
             // This avoids mutex overhead while preserving error propagation
@@ -43,6 +47,7 @@ impl RuntimeJoinScope {
 
         let previous = self.pending_children.fetch_sub(1, Ordering::AcqRel);
         debug_assert!(previous > 0, "runtime join scope child count underflow");
+        previous == 1
     }
 
     pub(crate) fn is_idle(&self) -> bool {
@@ -68,13 +73,27 @@ impl RuntimeJoinScope {
     }
 }
 
-#[derive(Clone)]
 pub struct RuntimeCtx {
     executor: Executor,
     worker_id: usize,
     scheduler: Option<RuntimeScheduler>,
     cancelled: Arc<AtomicBool>,
-    join_scope: Arc<RuntimeJoinScope>,
+    join_scope: OnceLock<Arc<RuntimeJoinScope>>,
+}
+
+impl Clone for RuntimeCtx {
+    fn clone(&self) -> Self {
+        let join_scope = OnceLock::new();
+        let _ = join_scope.set(Arc::clone(self.ensure_join_scope()));
+
+        Self {
+            executor: self.executor.clone(),
+            worker_id: self.worker_id,
+            scheduler: self.scheduler.clone(),
+            cancelled: Arc::clone(&self.cancelled),
+            join_scope,
+        }
+    }
 }
 
 impl RuntimeCtx {
@@ -83,15 +102,23 @@ impl RuntimeCtx {
         worker_id: usize,
         scheduler: Option<RuntimeScheduler>,
         cancelled: Arc<AtomicBool>,
-        join_scope: Arc<RuntimeJoinScope>,
     ) -> Self {
         Self {
             executor,
             worker_id,
             scheduler,
             cancelled,
-            join_scope,
+            join_scope: OnceLock::new(),
         }
+    }
+
+    pub(crate) fn ensure_join_scope(&self) -> &Arc<RuntimeJoinScope> {
+        self.join_scope
+            .get_or_init(|| Arc::new(RuntimeJoinScope::default()))
+    }
+
+    pub(crate) fn join_scope_ptr(&self) -> *const OnceLock<Arc<RuntimeJoinScope>> {
+        &self.join_scope
     }
 
     pub fn executor(&self) -> &Executor {
@@ -129,6 +156,7 @@ impl RuntimeCtx {
     where
         F: FnOnce(&RuntimeCtx) + Send + 'static,
     {
+        let join_scope = Arc::clone(self.ensure_join_scope());
         self.executor.schedule_runtime_silent_child(
             Box::new(move |runtime| {
                 task(runtime);
@@ -136,7 +164,7 @@ impl RuntimeCtx {
             }),
             Some(self.worker_id),
             Arc::clone(&self.cancelled),
-            Arc::clone(&self.join_scope),
+            join_scope,
         );
     }
 
@@ -144,19 +172,26 @@ impl RuntimeCtx {
     where
         F: FnOnce(&RuntimeCtx) -> Result<(), FlowError> + Send + 'static,
     {
+        let join_scope = Arc::clone(self.ensure_join_scope());
         self.executor.schedule_runtime_silent_child(
             Box::new(task),
             Some(self.worker_id),
             Arc::clone(&self.cancelled),
-            Arc::clone(&self.join_scope),
+            join_scope,
         );
     }
 
     pub fn corun_children(&self) -> Result<(), FlowError> {
-        self.executor
-            .wait_until_inline(self.worker_id, || self.join_scope.is_idle());
+        let Some(join_scope) = self.join_scope.get() else {
+            return Ok(());
+        };
 
-        self.join_scope.take_error().map_or(Ok(()), Err)
+        if !join_scope.is_idle() {
+            self.executor
+                .wait_until_inline(self.worker_id, || join_scope.is_idle());
+        }
+
+        join_scope.take_error().map_or(Ok(()), Err)
     }
 
     /// Cooperatively drive local work until the predicate becomes true.
@@ -164,7 +199,8 @@ impl RuntimeCtx {
     where
         P: FnMut() -> bool,
     {
-        self.executor.wait_until_inline(self.worker_id, || predicate());
+        self.executor
+            .wait_until_inline(self.worker_id, || predicate());
     }
 
     pub fn wait_async<T>(&self, handle: AsyncHandle<T>) -> Result<T, FlowError> {

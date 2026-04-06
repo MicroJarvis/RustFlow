@@ -1,7 +1,7 @@
 use std::cell::UnsafeCell;
 use std::marker::PhantomData;
 use std::mem::MaybeUninit;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 
 /// A lightweight spinlock for short-held critical sections.
@@ -22,17 +22,13 @@ impl SpinLock {
         }
     }
 
-    fn lock(&self) -> SpinLockGuard<'_> {
-        // Spin until we acquire the lock
-        while self
-            .locked
-            .compare_exchange_weak(false, true, Ordering::Acquire, Ordering::Relaxed)
-            .is_err()
-        {
-            // Use spin_loop hint to reduce contention
-            std::hint::spin_loop();
-        }
-        SpinLockGuard { locked: &self.locked }
+    fn try_lock(&self) -> Option<SpinLockGuard<'_>> {
+        self.locked
+            .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
+            .ok()
+            .map(|_| SpinLockGuard {
+                locked: &self.locked,
+            })
     }
 }
 
@@ -53,9 +49,11 @@ use crate::runtime::RuntimeCtx;
 
 struct LineSlot<T> {
     values: Vec<UnsafeCell<MaybeUninit<T>>>,
-    initialized: Vec<AtomicBool>,
+    initialized: Vec<UnsafeCell<bool>>,
 }
 
+// SAFETY: Each pipeline line owns a distinct slot index for the full run, so line-slot
+// payloads and initialized flags are only touched by one worker per index at a time.
 unsafe impl<T: Send> Send for LineSlot<T> {}
 unsafe impl<T: Send> Sync for LineSlot<T> {}
 
@@ -65,33 +63,39 @@ impl<T> LineSlot<T> {
             values: (0..num_lines)
                 .map(|_| UnsafeCell::new(MaybeUninit::uninit()))
                 .collect(),
-            initialized: (0..num_lines).map(|_| AtomicBool::new(false)).collect(),
+            initialized: (0..num_lines).map(|_| UnsafeCell::new(false)).collect(),
         }
     }
 
     fn write(&self, line: usize, value: T) {
-        if self.initialized[line].swap(true, Ordering::AcqRel) {
-            panic!("data pipeline line slot written before previous value was consumed");
-        }
-
         unsafe {
+            let initialized = &mut *self.initialized[line].get();
+            if *initialized {
+                panic!("data pipeline line slot written before previous value was consumed");
+            }
+
             (*self.values[line].get()).write(value);
+            *initialized = true;
         }
     }
 
     fn take(&self, line: usize) -> T {
-        if !self.initialized[line].swap(false, Ordering::AcqRel) {
-            panic!("data pipeline line slot should be initialized before use");
-        }
+        unsafe {
+            let initialized = &mut *self.initialized[line].get();
+            if !*initialized {
+                panic!("data pipeline line slot should be initialized before use");
+            }
 
-        unsafe { (*self.values[line].get()).assume_init_read() }
+            *initialized = false;
+            (*self.values[line].get()).assume_init_read()
+        }
     }
 }
 
 impl<T> Drop for LineSlot<T> {
     fn drop(&mut self) {
         for line in 0..self.values.len() {
-            if self.initialized[line].load(Ordering::Acquire) {
+            if *self.initialized[line].get_mut() {
                 unsafe {
                     self.values[line].get_mut().assume_init_drop();
                 }
@@ -179,7 +183,7 @@ impl PipeContext {
 struct StaticPipelineInner {
     num_lines: usize,
     pipes: Vec<Pipe>,
-    num_tokens: Mutex<usize>,
+    num_tokens: AtomicUsize,
     run_lock: Mutex<()>,
 }
 
@@ -196,7 +200,7 @@ impl Pipeline {
             inner: Arc::new(StaticPipelineInner {
                 num_lines,
                 pipes,
-                num_tokens: Mutex::new(0),
+                num_tokens: AtomicUsize::new(0),
                 run_lock: Mutex::new(()),
             }),
         }
@@ -211,19 +215,19 @@ impl Pipeline {
     }
 
     pub fn num_tokens(&self) -> usize {
-        *lock_unpoisoned(&self.inner.num_tokens)
+        self.inner.num_tokens.load(Ordering::Acquire)
     }
 
     pub fn reset(&self) {
         let _run_guard = lock_unpoisoned(&self.inner.run_lock);
-        *lock_unpoisoned(&self.inner.num_tokens) = 0;
+        self.inner.num_tokens.store(0, Ordering::Release);
     }
 
     pub fn run(&self, executor: &Executor) -> RunHandle {
         let pipeline = self.clone();
         executor.schedule_runtime_runner(Box::new(move |runtime| {
             let _run_guard = lock_unpoisoned(&pipeline.inner.run_lock);
-            *lock_unpoisoned(&pipeline.inner.num_tokens) = 0;
+            pipeline.inner.num_tokens.store(0, Ordering::Release);
             run_pipe_chain(
                 runtime,
                 pipeline.inner.num_lines,
@@ -242,7 +246,7 @@ struct ScalablePipelineConfig {
 
 struct ScalablePipelineInner {
     config: Mutex<ScalablePipelineConfig>,
-    num_tokens: Mutex<usize>,
+    num_tokens: AtomicUsize,
     run_lock: Mutex<()>,
 }
 
@@ -261,7 +265,7 @@ impl ScalablePipeline {
                     num_lines,
                     pipes: Vec::new(),
                 }),
-                num_tokens: Mutex::new(0),
+                num_tokens: AtomicUsize::new(0),
                 run_lock: Mutex::new(()),
             }),
         }
@@ -273,7 +277,7 @@ impl ScalablePipeline {
         Self {
             inner: Arc::new(ScalablePipelineInner {
                 config: Mutex::new(ScalablePipelineConfig { num_lines, pipes }),
-                num_tokens: Mutex::new(0),
+                num_tokens: AtomicUsize::new(0),
                 run_lock: Mutex::new(()),
             }),
         }
@@ -288,12 +292,12 @@ impl ScalablePipeline {
     }
 
     pub fn num_tokens(&self) -> usize {
-        *lock_unpoisoned(&self.inner.num_tokens)
+        self.inner.num_tokens.load(Ordering::Acquire)
     }
 
     pub fn reset(&self) {
         let _run_guard = lock_unpoisoned(&self.inner.run_lock);
-        *lock_unpoisoned(&self.inner.num_tokens) = 0;
+        self.inner.num_tokens.store(0, Ordering::Release);
     }
 
     pub fn reset_with_pipes(&self, pipes: Vec<Pipe>) {
@@ -301,21 +305,21 @@ impl ScalablePipeline {
         let mut config = lock_unpoisoned(&self.inner.config);
         validate_resettable_pipe_config(config.num_lines, &pipes);
         config.pipes = pipes;
-        *lock_unpoisoned(&self.inner.num_tokens) = 0;
+        self.inner.num_tokens.store(0, Ordering::Release);
     }
 
     pub fn reset_with_lines_and_pipes(&self, num_lines: usize, pipes: Vec<Pipe>) {
         let _run_guard = lock_unpoisoned(&self.inner.run_lock);
         validate_resettable_pipe_config(num_lines, &pipes);
         *lock_unpoisoned(&self.inner.config) = ScalablePipelineConfig { num_lines, pipes };
-        *lock_unpoisoned(&self.inner.num_tokens) = 0;
+        self.inner.num_tokens.store(0, Ordering::Release);
     }
 
     pub fn run(&self, executor: &Executor) -> RunHandle {
         let pipeline = self.clone();
         executor.schedule_runtime_runner(Box::new(move |runtime| {
             let _run_guard = lock_unpoisoned(&pipeline.inner.run_lock);
-            *lock_unpoisoned(&pipeline.inner.num_tokens) = 0;
+            pipeline.inner.num_tokens.store(0, Ordering::Release);
             let config = lock_unpoisoned(&pipeline.inner.config).clone();
             if config.pipes.is_empty() {
                 return Err(FlowError::plain("pipeline has no pipes configured"));
@@ -331,9 +335,8 @@ impl ScalablePipeline {
     }
 }
 
-#[derive(Clone)]
 struct DataStage {
-    runner: Arc<dyn DataStageRunner>,
+    runner: Box<dyn DataStageRunner>,
 }
 
 trait DataStageRunner: Send + Sync {
@@ -414,7 +417,7 @@ impl DataStage {
         let output = Arc::new(LineSlot::new(num_lines));
         (
             Self {
-                runner: Arc::new(SourceDataStage {
+                runner: Box::new(SourceDataStage {
                     pipe_type,
                     task,
                     output: Arc::clone(&output),
@@ -438,7 +441,7 @@ impl DataStage {
         let output = Arc::new(LineSlot::new(num_lines));
         (
             Self {
-                runner: Arc::new(TransformDataStage {
+                runner: Box::new(TransformDataStage {
                     pipe_type,
                     task,
                     input,
@@ -455,7 +458,7 @@ impl DataStage {
         F: Fn(&mut I, &mut PipeContext) + Send + Sync + 'static,
     {
         Self {
-            runner: Arc::new(SinkDataStage {
+            runner: Box::new(SinkDataStage {
                 pipe_type,
                 task,
                 input,
@@ -474,8 +477,8 @@ impl DataStage {
 
 struct DataPipelineInner {
     num_lines: usize,
-    stages: Vec<DataStage>,
-    num_tokens: Mutex<usize>,
+    stages: Arc<[DataStage]>,
+    num_tokens: AtomicUsize,
     run_lock: Mutex<()>,
 }
 
@@ -504,24 +507,24 @@ impl DataPipeline {
     }
 
     pub fn num_tokens(&self) -> usize {
-        *lock_unpoisoned(&self.inner.num_tokens)
+        self.inner.num_tokens.load(Ordering::Acquire)
     }
 
     pub fn reset(&self) {
         let _run_guard = lock_unpoisoned(&self.inner.run_lock);
-        *lock_unpoisoned(&self.inner.num_tokens) = 0;
+        self.inner.num_tokens.store(0, Ordering::Release);
     }
 
     pub fn run(&self, executor: &Executor) -> RunHandle {
         let pipeline = self.clone();
         executor.schedule_runtime_runner(Box::new(move |runtime| {
             let _run_guard = lock_unpoisoned(&pipeline.inner.run_lock);
-            *lock_unpoisoned(&pipeline.inner.num_tokens) = 0;
+            pipeline.inner.num_tokens.store(0, Ordering::Release);
 
             run_data_chain(
                 runtime,
                 pipeline.inner.num_lines,
-                pipeline.inner.stages.clone(),
+                Arc::clone(&pipeline.inner.stages),
                 &pipeline.inner.num_tokens,
             )
         }))
@@ -533,8 +536,8 @@ impl DataPipeline {
         Self {
             inner: Arc::new(DataPipelineInner {
                 num_lines,
-                stages,
-                num_tokens: Mutex::new(0),
+                stages: Arc::from(stages),
+                num_tokens: AtomicUsize::new(0),
                 run_lock: Mutex::new(()),
             }),
         }
@@ -607,61 +610,113 @@ where
 
 struct PipelineRunState {
     next_token: AtomicUsize,
-    stopped: AtomicBool,
+    flags: AtomicU8,
     cancelled: Arc<AtomicBool>,
     stage_locks: Vec<Option<SpinLock>>,
 }
 
 impl PipelineRunState {
-    fn new(stage_locks: Vec<Option<SpinLock>>, cancelled: Arc<AtomicBool>) -> Self {
+    fn new(stage_is_serial: Vec<bool>, cancelled: Arc<AtomicBool>) -> Self {
         Self {
             next_token: AtomicUsize::new(0),
-            stopped: AtomicBool::new(false),
+            flags: AtomicU8::new(0),
             cancelled,
-            stage_locks,
+            stage_locks: stage_is_serial
+                .into_iter()
+                .map(|is_serial| is_serial.then_some(SpinLock::new()))
+                .collect(),
         }
     }
 
     fn request_stop(&self) {
-        self.stopped.store(true, Ordering::Release);
-        self.cancelled.store(true, Ordering::Release);
+        self.flags.fetch_or(Self::STOP_REQUESTED, Ordering::Release);
     }
 
-    fn should_stop(&self) -> bool {
-        self.stopped.load(Ordering::Acquire) || self.cancelled.load(Ordering::Acquire)
+    fn request_abort(&self) {
+        self.flags
+            .fetch_or(Self::ABORT_REQUESTED, Ordering::Release);
     }
+
+    fn should_stop_issuing_tokens(&self) -> bool {
+        self.flags.load(Ordering::Acquire) != 0 || self.cancelled.load(Ordering::Acquire)
+    }
+
+    fn should_abort_immediately(&self) -> bool {
+        self.flags.load(Ordering::Acquire) & Self::ABORT_REQUESTED != 0
+            || self.cancelled.load(Ordering::Acquire)
+    }
+
+    const STOP_REQUESTED: u8 = 0b01;
+    const ABORT_REQUESTED: u8 = 0b10;
 }
 
+enum SerialStageAcquire<'a> {
+    Acquired(SpinLockGuard<'a>),
+    StopRequested,
+}
+
+fn acquire_serial_stage<'a>(
+    stage_lock: &'a SpinLock,
+    run_state: &PipelineRunState,
+    stop_if_requested: bool,
+) -> SerialStageAcquire<'a> {
+    const STOP_CHECK_INTERVAL: usize = 8;
+    let max_spins = if stop_if_requested { 32 } else { 16 };
+    let mut spins = 0usize;
+
+    loop {
+        if let Some(guard) = stage_lock.try_lock() {
+            return SerialStageAcquire::Acquired(guard);
+        }
+
+        spins += 1;
+        if spins % STOP_CHECK_INTERVAL == 0
+            && (run_state.should_abort_immediately()
+                || (stop_if_requested && run_state.should_stop_issuing_tokens()))
+        {
+            return SerialStageAcquire::StopRequested;
+        }
+
+        if spins < max_spins {
+            std::hint::spin_loop();
+            continue;
+        }
+
+        spins = 0;
+        std::thread::yield_now();
+    }
+}
 fn run_pipe_chain(
     runtime: &RuntimeCtx,
     num_lines: usize,
     pipes: Vec<Pipe>,
-    num_tokens: &Mutex<usize>,
+    num_tokens: &AtomicUsize,
 ) -> Result<(), FlowError> {
     let pipes: Arc<[Pipe]> = Arc::from(pipes);
     let run_state = Arc::new(PipelineRunState::new(
         pipes
             .iter()
-            .map(|pipe| (pipe.pipe_type() == PipeType::Serial).then_some(SpinLock::new()))
+            .map(|pipe| pipe.pipe_type() == PipeType::Serial)
             .collect(),
         runtime.cancelled_flag(),
     ));
+    let batch_size = compute_batch_size(num_lines);
 
     for line in 1..num_lines {
         let pipes = Arc::clone(&pipes);
         let run_state = Arc::clone(&run_state);
         runtime.silent_result_async(move |_| {
-            let result = run_pipe_line(pipes, line, Arc::clone(&run_state));
+            let result = run_pipe_line(pipes, line, Arc::clone(&run_state), batch_size);
             if result.is_err() {
-                run_state.request_stop();
+                run_state.request_abort();
             }
             result
         });
     }
 
-    let inline_result = run_pipe_line(Arc::clone(&pipes), 0, Arc::clone(&run_state));
+    let inline_result = run_pipe_line(Arc::clone(&pipes), 0, Arc::clone(&run_state), batch_size);
     if inline_result.is_err() {
-        run_state.request_stop();
+        run_state.request_abort();
     }
 
     let children_result = runtime.corun_children();
@@ -672,61 +727,106 @@ fn run_pipe_chain(
             Err(error)
         }
     };
-    *lock_unpoisoned(num_tokens) = run_state.next_token.load(Ordering::Acquire);
+    num_tokens.store(
+        run_state.next_token.load(Ordering::Acquire),
+        Ordering::Release,
+    );
     result
+}
+
+/// Compute an adaptive batch size based on the number of pipeline lines.
+/// For single-line pipelines, batch aggressively since there's no inter-line contention.
+/// For multi-line, batch_size=1 preserves strict token ordering across stages.
+fn compute_batch_size(num_lines: usize) -> usize {
+    if num_lines <= 1 { 16 } else { 1 }
 }
 
 fn run_pipe_line(
     pipes: Arc<[Pipe]>,
     line: usize,
     run_state: Arc<PipelineRunState>,
+    batch_size: usize,
 ) -> Result<(), FlowError> {
     loop {
-        if run_state.should_stop() {
+        if run_state.should_stop_issuing_tokens() {
             return Ok(());
         }
 
-        let mut context = PipeContext {
-            line,
-            pipe: 0,
-            token: 0,
-            stop_requested: false,
-        };
-
+        // Acquire stage 0 lock once and issue a batch of tokens.
+        let batch_start;
+        let mut batch_count = 0usize;
         {
-            let _stage_guard = run_state.stage_locks[0]
+            let stage0_lock = run_state.stage_locks[0]
                 .as_ref()
-                .expect("the first pipe must be serial")
-                .lock();
+                .expect("the first pipe must be serial");
 
-            if run_state.should_stop() {
+            let SerialStageAcquire::Acquired(_stage_guard) =
+                acquire_serial_stage(stage0_lock, &run_state, true)
+            else {
+                return Ok(());
+            };
+
+            if run_state.should_stop_issuing_tokens() {
                 return Ok(());
             }
 
-            let next_token = run_state.next_token.load(Ordering::Acquire);
-            context.token = next_token;
-            pipes[0].run(&mut context);
+            batch_start = run_state.next_token.load(Ordering::Acquire);
 
-            if context.stop_requested {
-                run_state.request_stop();
-                return Ok(());
+            for i in 0..batch_size {
+                let token = batch_start + i;
+                let mut context = PipeContext {
+                    line,
+                    pipe: 0,
+                    token,
+                    stop_requested: false,
+                };
+                pipes[0].run(&mut context);
+                if context.stop_requested {
+                    // Don't count the stop token; commit only successfully issued tokens.
+                    run_state
+                        .next_token
+                        .store(batch_start + batch_count, Ordering::Release);
+                    run_state.request_stop();
+                    // Still process remaining stages for already-issued tokens below.
+                    break;
+                }
+                batch_count = i + 1;
             }
 
-            run_state
-                .next_token
-                .store(next_token + 1, Ordering::Release);
+            if !run_state.should_stop_issuing_tokens() {
+                run_state
+                    .next_token
+                    .store(batch_start + batch_count, Ordering::Release);
+            }
         }
 
-        // Once a line has claimed a token from stage 0, let it drain through the
-        // remaining stages before honoring a global stop or cancellation request.
-        for pipe_index in 1..pipes.len() {
-            context.pipe = pipe_index;
-            if let Some(stage_lock) = &run_state.stage_locks[pipe_index] {
-                let _stage_guard = stage_lock.lock();
-                pipes[pipe_index].run(&mut context);
-            } else {
-                pipes[pipe_index].run(&mut context);
+        // Process each issued token through all remaining stages, maintaining
+        // token ordering (same as original per-token processing).
+        for i in 0..batch_count {
+            let token = batch_start + i;
+            let mut context = PipeContext {
+                line,
+                pipe: 0,
+                token,
+                stop_requested: false,
+            };
+            for pipe_index in 1..pipes.len() {
+                context.pipe = pipe_index;
+                if let Some(stage_lock) = &run_state.stage_locks[pipe_index] {
+                    let SerialStageAcquire::Acquired(_stage_guard) =
+                        acquire_serial_stage(stage_lock, &run_state, false)
+                    else {
+                        return Ok(());
+                    };
+                    pipes[pipe_index].run(&mut context);
+                } else {
+                    pipes[pipe_index].run(&mut context);
+                }
             }
+        }
+
+        if run_state.should_stop_issuing_tokens() {
+            return Ok(());
         }
     }
 }
@@ -734,33 +834,33 @@ fn run_pipe_line(
 fn run_data_chain(
     runtime: &RuntimeCtx,
     num_lines: usize,
-    stages: Vec<DataStage>,
-    num_tokens: &Mutex<usize>,
+    stages: Arc<[DataStage]>,
+    num_tokens: &AtomicUsize,
 ) -> Result<(), FlowError> {
-    let stages: Arc<[DataStage]> = Arc::from(stages);
     let run_state = Arc::new(PipelineRunState::new(
         stages
             .iter()
-            .map(|stage| (stage.pipe_type() == PipeType::Serial).then_some(SpinLock::new()))
+            .map(|stage| stage.pipe_type() == PipeType::Serial)
             .collect(),
         runtime.cancelled_flag(),
     ));
+    let batch_size = compute_batch_size(num_lines);
 
     for line in 1..num_lines {
         let stages = Arc::clone(&stages);
         let run_state = Arc::clone(&run_state);
         runtime.silent_result_async(move |_| {
-            let result = run_data_line(stages, line, Arc::clone(&run_state));
+            let result = run_data_line(stages, line, Arc::clone(&run_state), batch_size);
             if result.is_err() {
-                run_state.request_stop();
+                run_state.request_abort();
             }
             result
         });
     }
 
-    let inline_result = run_data_line(Arc::clone(&stages), 0, Arc::clone(&run_state));
+    let inline_result = run_data_line(Arc::clone(&stages), 0, Arc::clone(&run_state), batch_size);
     if inline_result.is_err() {
-        run_state.request_stop();
+        run_state.request_abort();
     }
 
     let children_result = runtime.corun_children();
@@ -771,7 +871,10 @@ fn run_data_chain(
             Err(error)
         }
     };
-    *lock_unpoisoned(num_tokens) = run_state.next_token.load(Ordering::Acquire);
+    num_tokens.store(
+        run_state.next_token.load(Ordering::Acquire),
+        Ordering::Release,
+    );
     result
 }
 
@@ -779,52 +882,83 @@ fn run_data_line(
     stages: Arc<[DataStage]>,
     line: usize,
     run_state: Arc<PipelineRunState>,
+    batch_size: usize,
 ) -> Result<(), FlowError> {
     loop {
-        if run_state.should_stop() {
+        if run_state.should_stop_issuing_tokens() {
             return Ok(());
         }
 
-        let mut context = PipeContext {
-            line,
-            pipe: 0,
-            token: 0,
-            stop_requested: false,
-        };
+        let batch_start;
+        let mut batch_count = 0usize;
         {
-            let _stage_guard = run_state.stage_locks[0]
+            let stage0_lock = run_state.stage_locks[0]
                 .as_ref()
-                .expect("the first pipe must be serial")
-                .lock();
+                .expect("the first pipe must be serial");
 
-            if run_state.should_stop() {
+            let SerialStageAcquire::Acquired(_stage_guard) =
+                acquire_serial_stage(stage0_lock, &run_state, true)
+            else {
+                return Ok(());
+            };
+
+            if run_state.should_stop_issuing_tokens() {
                 return Ok(());
             }
 
-            let next_token = run_state.next_token.load(Ordering::Acquire);
-            context.token = next_token;
-            stages[0].run(line, &mut context);
+            batch_start = run_state.next_token.load(Ordering::Acquire);
 
-            if context.stop_requested {
-                run_state.request_stop();
-                return Ok(());
+            for i in 0..batch_size {
+                let token = batch_start + i;
+                let mut context = PipeContext {
+                    line,
+                    pipe: 0,
+                    token,
+                    stop_requested: false,
+                };
+                stages[0].run(line, &mut context);
+                if context.stop_requested {
+                    run_state
+                        .next_token
+                        .store(batch_start + batch_count, Ordering::Release);
+                    run_state.request_stop();
+                    break;
+                }
+                batch_count = i + 1;
             }
 
-            run_state
-                .next_token
-                .store(next_token + 1, Ordering::Release);
+            if !run_state.should_stop_issuing_tokens() {
+                run_state
+                    .next_token
+                    .store(batch_start + batch_count, Ordering::Release);
+            }
         }
 
-        // Once a line has claimed a token from stage 0, let it drain through the
-        // remaining stages before honoring a global stop or cancellation request.
-        for pipe_index in 1..stages.len() {
-            context.pipe = pipe_index;
-            if let Some(stage_lock) = &run_state.stage_locks[pipe_index] {
-                let _stage_guard = stage_lock.lock();
-                stages[pipe_index].run(line, &mut context);
-            } else {
-                stages[pipe_index].run(line, &mut context);
+        for i in 0..batch_count {
+            let token = batch_start + i;
+            let mut context = PipeContext {
+                line,
+                pipe: 0,
+                token,
+                stop_requested: false,
+            };
+            for pipe_index in 1..stages.len() {
+                context.pipe = pipe_index;
+                if let Some(stage_lock) = &run_state.stage_locks[pipe_index] {
+                    let SerialStageAcquire::Acquired(_stage_guard) =
+                        acquire_serial_stage(stage_lock, &run_state, false)
+                    else {
+                        return Ok(());
+                    };
+                    stages[pipe_index].run(line, &mut context);
+                } else {
+                    stages[pipe_index].run(line, &mut context);
+                }
             }
+        }
+
+        if run_state.should_stop_issuing_tokens() {
+            return Ok(());
         }
     }
 }

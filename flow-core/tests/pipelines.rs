@@ -60,6 +60,62 @@ fn linear_pipeline_processes_tokens_until_stop() {
 }
 
 #[test]
+fn all_serial_pipeline_counts_each_stage_once_per_token() {
+    let executor = Executor::new(4);
+    let stage_counts = Arc::new((0..8).map(|_| AtomicUsize::new(0)).collect::<Vec<_>>());
+    let stop_seen = Arc::new(AtomicUsize::new(0));
+    let unexpected_token_eight = Arc::new(AtomicUsize::new(0));
+    let final_stage_order = Arc::new(Mutex::new(Vec::new()));
+
+    let mut pipes = Vec::new();
+    for pipe_index in 0..8 {
+        let stage_counts = Arc::clone(&stage_counts);
+        let stop_seen = Arc::clone(&stop_seen);
+        let unexpected_token_eight = Arc::clone(&unexpected_token_eight);
+        let final_stage_order = Arc::clone(&final_stage_order);
+        pipes.push(Pipe::serial(move |ctx| {
+            if ctx.token() == 8 {
+                if pipe_index == 0 {
+                    stop_seen.fetch_add(1, Ordering::SeqCst);
+                    ctx.stop();
+                } else {
+                    unexpected_token_eight.fetch_add(1, Ordering::SeqCst);
+                }
+                return;
+            }
+
+            stage_counts[pipe_index].fetch_add(1, Ordering::SeqCst);
+            if pipe_index == 7 {
+                final_stage_order
+                    .lock()
+                    .expect("final_stage_order poisoned")
+                    .push(ctx.token());
+            }
+        }));
+    }
+
+    let pipeline = Pipeline::from_pipes(4, pipes);
+    pipeline
+        .run(&executor)
+        .wait()
+        .expect("all-serial pipeline run should succeed");
+
+    assert_eq!(pipeline.num_tokens(), 8);
+    assert_eq!(stop_seen.load(Ordering::SeqCst), 1);
+    assert_eq!(unexpected_token_eight.load(Ordering::SeqCst), 0);
+    for pipe_index in 0..8 {
+        assert_eq!(stage_counts[pipe_index].load(Ordering::SeqCst), 8);
+    }
+    assert_eq!(
+        final_stage_order
+            .lock()
+            .expect("final_stage_order poisoned")
+            .as_slice(),
+        &[0, 1, 2, 3, 4, 5, 6, 7]
+    );
+}
+
+#[test]
 fn serial_and_parallel_pipes_apply_expected_concurrency() {
     let executor = Executor::new(4);
     let active_parallel = Arc::new(AtomicUsize::new(0));
