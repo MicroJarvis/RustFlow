@@ -1,5 +1,46 @@
 # RustFlow 第二轮性能优化计划
 
+## 一页摘要：当前进展与下一步计划（2026-04-06）
+
+### 当前进展（已完成并进入主线）
+
+- `TaskGroup/runtime/graph` 方向的已验证优化已落地并通过 `cargo test -p flow-core`：
+  - `PipelineRunState` 本地 stop/abort flags 合并 + serial-stage 自适应退避
+  - `RuntimeJoinScope` 改为 `OnceLock` 惰性分配
+  - `GraphSnapshot` 的 `initial_pending` 缓存 + 小图栈上 fast path
+  - `TaskGroup` child fast path、惰性 state、batch `active_runs` 记账
+- `P1 pipeline` 已完成三轮证据驱动实验并收敛出当前基线：
+  - 保留：pipeline line child 走 global enqueue（核心稳定收益来源）
+  - 保留：bounded-spin + `yield_now` serial-stage gate
+  - 保留：pipeline profile 诊断能力
+  - 不进入主线默认：all-serial fast path、hot path relaxed atomic、`corun_until` stage gate（收益不稳定或存在回退）
+
+### 当前结论（用于后续决策）
+
+- `corun_children` 等待时间在 profile 中是微秒级，不是当前 pipeline 主瓶颈。
+- pipeline 当前主要收益来自“line-level 工作分散到全局调度”，而不是等待协议重写或单纯锁竞争优化。
+- 在现有证据下继续堆叠 pipeline 微优化，边际收益已明显下降；需要更强新证据才能继续把时间投入在 P1 微调。
+
+### 下一步计划（按最新优先级）
+
+1. `P0` 固化基线：维持已验证收益，不回退 global line spawn 与现有 stage gate 语义。
+2. `P2` 转入通用 DAG 调度热路径（主线下一阶段）：
+   - 目标 case：`graph_pipeline`、`wavefront`
+   - 聚焦 ready 队列投递、`pending/reset` 热路径、continuation/批量入队
+3. `P3` 处理 flow build/snapshot 成本（补充项）：
+   - 目标 case：`thread_pool`、`linear_chain`
+4. `P1` 仅保留证据驱动的小实验入口：
+   - 只有当新 profile 明确显示 pipeline 仍有确定性热点，才继续做微优化
+5. `P4/P5` 维持候选状态：
+   - `corun_children` 协议重写与高语义风险方案不进入当前主线
+
+### 执行门槛（Gate）
+
+- 每个新优化分支必须同时满足：
+  - 在 `3 rounds / 4 threads` 下对目标 case 呈现稳定改善（非噪声）
+  - 不破坏现有语义约束：`token()` 全局单调、`stop()` 边界、`num_tokens()` 准确、运行中 `cancel()` 有效
+- 若连续两轮无稳定增益，立即切回下一优先级任务，避免在单一热点上过度消耗。
+
 ## 背景：第一轮优化成果与剩余差距
 
 第一轮（2026-04-06）实施了 4 项优化：放宽内存序、内联 work-stealing fast path、轻量 Task 表示、Pipeline token 批处理。
@@ -51,6 +92,45 @@
 - `data_pipeline` / `linear_pipeline` / `graph_pipeline` 仍然稳定偏红，说明当前主瓶颈已回到 pipeline serial-stage 协调和通用 DAG 调度，而不是 `TaskGroup`
 - `runtime child` 的 batch `active_runs` 记账尝试对 pipeline 没有明确收益，已撤回；`TaskGroup` 侧的 batch 记账保留
 
+P1 已完成第一轮证据收集（`2026-04-06`）：
+
+- 已为 `Pipeline` / `ScalablePipeline` / `DataPipeline` 加入可选运行时 profile，拆分记录：
+  - serial stage 获取次数与竞争等待
+  - `corun_children` 总等待、空转等待、inline 执行次数
+- 基于 `cargo run -p benchmarks --release --bin taskflow_compare -- --threads 4 --rounds 1 --cases data_pipeline,graph_pipeline,linear_pipeline --pipeline-profile` 的结果，`corun_children` 等待量级始终只有微秒级，而 case 总耗时仍在毫秒级
+- 在大点位上，serial-stage 获取次数与 token 数严格同阶增长，例如：
+  - `data_pipeline @1024`: `stage0 total = 1025`，`downstream total = 7168`
+  - `linear_pipeline @1024`: `stage0 total = 1025`，`downstream total = 7168`
+  - `graph_pipeline @12904`: `stage0 total = 3722`，`downstream total = 26047`
+- 同一轮 profile 中，竞争等待几乎为零，说明当前主损耗更像是“每次 serial-stage 协调的固定成本”而不是“严重锁竞争”或 `corun_children` 轮询等待
+- 结论：P1 主线转向 serial-stage 无竞争 fast path / 协调开销瘦身；`优化E` 继续保留为候选分支，不进入当前主线
+
+P1 已完成第二轮受控实验（`2026-04-06`）：
+
+- 基于第一轮 profile 的 `inline_exec ~= 7` 信号，定位出一个更具体的问题：pipeline line child 默认通过 `runtime.silent_result_async` 贴在父 worker 本地队列上，`corun_children` 常常把 7 个 line child 直接 inline 跑完，实际并没有把 line-level 工作充分扩散到其它 worker
+- 已增加仅供 pipeline 内部使用的 global child enqueue 路径，让 line runner 直接进入 injector，可被其它 worker 立即窃取；普通 runtime child 行为保持不变
+- 3-round benchmark 结果显示该改动不是噪声，而是稳定主线收益：
+  - `data_pipeline @1024`: 约 `4.075x -> 2.586x`
+  - `linear_pipeline @1024`: 约 `3.768x -> 1.938x`
+  - `graph_pipeline @12904`: 约 `5.261x -> 2.881x`
+- 结论修正：P1 当前最有效的收益并不来自等待协议改写，也不只是“锁本身”，而是 pipeline line runner 的调度局部性过强；主线应先保留 global line spawn，再继续压 serial-stage 协调固定成本
+
+P1 已完成第三轮 follow-up 实验（`2026-04-06`）：
+
+- 在保留 global line spawn 的前提下，又试了几类更轻的 pipeline 微优化：
+  - all-serial 专用 fast path（去掉 `Option` 分支与部分 bounds check）
+  - 热路径控制型原子改成更轻的顺序
+  - serial-stage 等待从 `yield_now` 改成 `corun_until`
+- 这些实验都没有给出足够稳定的主线收益：
+  - all-serial fast path 基本持平，`data_pipeline` 还有轻微回退
+  - 更轻原子序在 `data_pipeline` / `linear_pipeline` / `graph_pipeline` 上只有小幅波动，没有形成稳定改善
+  - `corun_until` 版 stage gate 对 `graph_pipeline` 有轻微正向，但 `data_pipeline` 绝对耗时回退，不适合作为主线默认行为
+- 因此当前主线保留项收敛为：
+  - global line spawn
+  - 现有 bounded-spin + `yield_now` serial-stage gate
+  - pipeline profile 诊断能力
+- 后续若继续做 pipeline 主线，应优先寻找“确定性更高”的收益点；若连续几轮都只是微小噪声，则应转入下一优先级任务，而不是继续堆叠 pipeline 微优化
+
 ### 剩余任务优先级（更新）
 
 ```
@@ -58,9 +138,11 @@ P0: 固化当前基线
   └── 保持 TaskGroup/graph/runtime 已验证优化，后续 pipeline 实验不得回滚这些收益
 
 P1: Pipeline 主线热点（最高优先级）
-  ├── 先做证据收集：stage lock 竞争 vs corun_children 等待，到底谁更贵
-  ├── 若 stage lock 更贵：优先推进优化A后续/serial-stage 协调路径
-  └── 若等待更贵：优先推进优化E的受控版本（先短等待，再决定是否做完整协议改写）
+  ├── 已完成证据收集：`corun_children` 等待不是主瓶颈
+  ├── 已验证保留：pipeline line child 走 global enqueue，而不是粘在父 worker 本地队列
+  ├── 继续做 pipeline 微优化前，必须先有比“all-serial fast path / relaxed atomic / corun stage gate”更强的新证据
+  ├── 若没有更强证据，下一步应转入 P2 的通用 DAG 调度热路径
+  └── `优化E` 暂不进入主线，仅保留为后备候选
 
 P2: 通用 DAG 调度热路径
   ├── 目标 case：graph_pipeline, wavefront
@@ -82,6 +164,8 @@ P5: 低收益或高风险候选（默认暂停）
 ### 执行原则（更新）
 
 - 接下来的主线工作默认围绕 `Pipeline` 与通用 DAG 调度，不再把 `TaskGroup` 当成第一优先级
+- `P1` 已确认不先做 `corun_children` 协议改写，除非后续轻量实验重新给出相反证据
+- `P1` 已确认需要保留 pipeline line runner 的 global enqueue；后续优化不能退回到“父 worker 本地队列 + corun inline 全包”模式
 - 所有新的 pipeline 改动都必须先保住现有 token 语义：`PipeContext.token()` 全局单调、`stop()` 边界不变、`num_tokens()` 准确
 - `优化E` 不再默认作为“第三阶段必做项”，而是改为证据驱动的候选分支
 - `TaskGroup`/runtime 方向若继续推进，只能作为补充项，不能阻塞 pipeline 主线
