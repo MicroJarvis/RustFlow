@@ -9,7 +9,9 @@ use crate::parallel_for::{ParallelForOptions, chunk_ranges_for_workers};
 
 const SCAN_SEQUENTIAL_CUTOFF_PER_WORKER: usize = 2_048;
 // Sort tuning knobs. Keep these local until the benchmark contract is stable.
-const SORT_SEQUENTIAL_CUTOFF_PER_WORKER: usize = 32_768;
+// Higher cutoff because Rust's sort_unstable is very fast and parallel overhead can exceed benefit
+// for small-to-medium datasets. Set to ~128K per worker so 8 workers = 1M cutoff.
+const SORT_SEQUENTIAL_CUTOFF_PER_WORKER: usize = 128_000;
 const SORT_INSERTION_SORT_THRESHOLD: usize = 24;
 const SORT_PARTIAL_INSERTION_SORT_LIMIT: usize = 8;
 const SORT_NINTHER_THRESHOLD: usize = 128;
@@ -912,6 +914,43 @@ where
             }
         }
 
+        // New strategy: spawn both partitions if both > cutoff (join pattern)
+        if left_len > sequential_cutoff && right_len > sequential_cutoff {
+            let left_is_less = Arc::clone(&is_less);
+            let right_is_less = Arc::clone(&is_less);
+
+            runtime.silent_async(move |runtime| unsafe {
+                parallel_quicksort(
+                    runtime,
+                    data,
+                    left_begin,
+                    left_end,
+                    left_is_less,
+                    sequential_cutoff,
+                    bad_partition_budget,
+                    left_is_leftmost,
+                )
+                .expect("parallel sort child should succeed");
+            });
+
+            runtime.silent_async(move |runtime| unsafe {
+                parallel_quicksort(
+                    runtime,
+                    data,
+                    right_begin,
+                    right_end,
+                    right_is_less,
+                    sequential_cutoff,
+                    bad_partition_budget,
+                    right_is_leftmost,
+                )
+                .expect("parallel sort child should succeed");
+            });
+
+            runtime.corun_children()?;
+            break;
+        }
+
         if left_len <= sequential_cutoff && right_len <= sequential_cutoff {
             if left_len > 1 {
                 unsafe {
@@ -938,26 +977,14 @@ where
             break;
         }
 
+        // One partition > cutoff, one <= cutoff: spawn the larger, process smaller inline
         let (spawn_begin, spawn_end, spawn_leftmost, inline_begin, inline_end, inline_leftmost) =
-            if left_len <= right_len {
-                (
-                    left_begin,
-                    left_end,
-                    left_is_leftmost,
-                    right_begin,
-                    right_end,
-                    right_is_leftmost,
-                )
+            if left_len > right_len {
+                (left_begin, left_end, left_is_leftmost, right_begin, right_end, right_is_leftmost)
             } else {
-                (
-                    right_begin,
-                    right_end,
-                    right_is_leftmost,
-                    left_begin,
-                    left_end,
-                    left_is_leftmost,
-                )
+                (right_begin, right_end, right_is_leftmost, left_begin, left_end, left_is_leftmost)
             };
+
         let spawn_len = spawn_end.saturating_sub(spawn_begin);
         let inline_len = inline_end.saturating_sub(inline_begin);
 
@@ -979,6 +1006,7 @@ where
         }
 
         if inline_len <= 1 {
+            runtime.corun_children()?;
             break;
         }
 

@@ -5,6 +5,7 @@
 //! `parallel_for`, `reduce`, `transform`, `find`, inclusive and exclusive
 //! scan, and sort adapters.
 
+mod chunk_buffer;
 mod find_scan_sort;
 mod parallel_for;
 mod partitioner;

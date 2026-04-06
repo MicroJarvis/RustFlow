@@ -1,19 +1,25 @@
+use std::cell::UnsafeCell;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicUsize, Ordering};
 
-use flow_core::{Executor, Flow, FlowError};
+use flow_core::{Executor, FlowError};
 
-use crate::parallel_for::{ParallelForOptions, chunk_ranges_aligned_to_workers};
+use crate::chunk_buffer::ChunkBuffer;
+use crate::parallel_for::ParallelForOptions;
 use crate::partitioner::{DynamicPartitioner, PartitionState, Partitioner};
-use crate::write_once_buffer::WriteOnceBuffer;
 
 const TRANSFORM_SEQUENTIAL_CUTOFF_PER_WORKER: usize = 8_192;
 const REDUCE_SEQUENTIAL_CUTOFF_PER_WORKER: usize = 8_192;
 
+/// Parallel transform using TaskGroup for lightweight scheduling.
+///
+/// This implementation avoids the overhead of Flow graph construction
+/// and WriteOnceBuffer's per-element atomics by using:
+/// - TaskGroup for direct task spawning without RunHandle allocation
+/// - ChunkBuffer with exclusive chunk access (no per-element atomics)
 pub fn parallel_transform<T, U, F>(
     executor: &Executor,
     input: Arc<[T]>,
-    options: ParallelForOptions,
+    _options: ParallelForOptions,
     transform: F,
 ) -> Result<Vec<U>, FlowError>
 where
@@ -26,39 +32,66 @@ where
     }
 
     let workers = executor.num_workers().max(1);
-    if input.len() <= workers.saturating_mul(TRANSFORM_SEQUENTIAL_CUTOFF_PER_WORKER) {
+    let len = input.len();
+
+    // Sequential cutoff for small inputs
+    if len <= workers.saturating_mul(TRANSFORM_SEQUENTIAL_CUTOFF_PER_WORKER) {
         return Ok(input.iter().map(|value| transform(value)).collect());
     }
 
-    let flow = Flow::new();
-    let transform = Arc::new(transform);
-    let chunks = chunk_ranges_aligned_to_workers(0..input.len(), options, workers);
-    let output = Arc::new(WriteOnceBuffer::new(input.len()));
+    let w = workers.min(len);
 
-    for chunk in chunks {
-        let input = Arc::clone(&input);
-        let output = Arc::clone(&output);
-        let transform = Arc::clone(&transform);
-        let chunk_start = chunk.start;
-        let chunk_end = chunk.end;
-        flow.spawn(move || {
-            for index in chunk_start..chunk_end {
-                let value = transform(&input[index]);
-                output.write(index, value);
+    // Calculate balanced chunks for each worker
+    let base_chunk = len / w;
+    let remainder = len % w;
+
+    let root_executor = executor.clone();
+    executor
+        .async_task(move || {
+            let output: Arc<ChunkBuffer<U>> = Arc::new(ChunkBuffer::new_uninit(len));
+            let transform_fn = Arc::new(transform);
+
+            let tg = root_executor.task_group();
+
+            for worker_id in 0..w {
+                let start = worker_id * base_chunk + worker_id.min(remainder);
+                let end = start + base_chunk + if worker_id < remainder { 1 } else { 0 };
+
+                let input = Arc::clone(&input);
+                let output = Arc::clone(&output);
+                let transform = Arc::clone(&transform_fn);
+
+                tg.silent_async(move || {
+                    for i in start..end {
+                        let value = transform(&input[i]);
+                        unsafe {
+                            output.write(i, value);
+                        }
+                    }
+                });
             }
-        });
-    }
 
-    executor.run(&flow).wait()?;
-    drop(flow);
+            tg.corun()?;
 
-    Ok((0..input.len()).map(|index| output.take(index)).collect())
+            // Convert buffer to Vec - safe because all workers have completed
+            let output = Arc::try_unwrap(output).unwrap_or_else(|_| {
+                panic!("all output references should be dropped after task completion")
+            });
+            Ok(unsafe { output.into_inner_assume_init() })
+        })
+        .wait()
+        .and_then(|inner| inner)
 }
 
+/// Parallel reduce using TaskGroup for lightweight scheduling.
+///
+/// This implementation avoids the overhead of Flow graph construction
+/// by using TaskGroup for direct task spawning. Each worker accumulates
+/// partial results into its own cache-line padded slot to avoid false sharing.
 pub fn parallel_reduce<T, F>(
     executor: &Executor,
     input: Arc<[T]>,
-    options: ParallelForOptions,
+    _options: ParallelForOptions,
     init: T,
     reduce: F,
 ) -> Result<T, FlowError>
@@ -71,7 +104,10 @@ where
     }
 
     let workers = executor.num_workers().max(1);
-    if input.len() <= workers.saturating_mul(REDUCE_SEQUENTIAL_CUTOFF_PER_WORKER) {
+    let len = input.len();
+
+    // Sequential cutoff for small inputs
+    if len <= workers.saturating_mul(REDUCE_SEQUENTIAL_CUTOFF_PER_WORKER) {
         let mut iter = input.iter().cloned();
         let first = iter
             .next()
@@ -80,37 +116,71 @@ where
         return Ok(reduce(init, partial));
     }
 
-    let flow = Flow::new();
-    let reduce = Arc::new(reduce);
-    let chunks = chunk_ranges_aligned_to_workers(0..input.len(), options, workers);
-    let num_chunks = chunks.len();
-    let partials = Arc::new(WriteOnceBuffer::new(chunks.len()));
+    let w = workers.min(len);
 
-    for (chunk_index, chunk) in chunks.into_iter().enumerate() {
-        let input = Arc::clone(&input);
-        let partials = Arc::clone(&partials);
-        let reduce = Arc::clone(&reduce);
-        let chunk_start = chunk.start;
-        let chunk_end = chunk.end;
-        flow.spawn(move || {
-            let mut iter = chunk_start..chunk_end;
-            let first = iter
-                .next()
-                .expect("parallel reduce chunk should never be empty");
-            let mut acc = input[first].clone();
-            for index in iter {
-                acc = reduce(acc, input[index].clone());
+    // Cache-line padded partial results to avoid false sharing
+    #[repr(align(64))]
+    struct CacheLine<T>(UnsafeCell<Option<T>>);
+
+    unsafe impl<T: Send> Send for CacheLine<T> {}
+    unsafe impl<T: Send> Sync for CacheLine<T> {}
+
+    // Calculate balanced chunks for each worker
+    let base_chunk = len / w;
+    let remainder = len % w;
+
+    let root_executor = executor.clone();
+    executor
+        .async_task(move || {
+            let partials: Arc<Vec<CacheLine<T>>> = Arc::new(
+                (0..w)
+                    .map(|_| CacheLine(UnsafeCell::new(None)))
+                    .collect(),
+            );
+
+            let reduce_fn = Arc::new(reduce);
+
+            let tg = root_executor.task_group();
+
+            for worker_id in 0..w {
+                let start = worker_id * base_chunk + worker_id.min(remainder);
+                let end = start + base_chunk + if worker_id < remainder { 1 } else { 0 };
+
+                let input = Arc::clone(&input);
+                let partials = Arc::clone(&partials);
+                let reduce_fn = Arc::clone(&reduce_fn);
+
+                tg.silent_async(move || {
+                    // Process this worker's chunk
+                    let mut acc = input[start].clone();
+                    for i in (start + 1)..end {
+                        acc = reduce_fn(acc, input[i].clone());
+                    }
+
+                    // Store partial result in this worker's exclusive slot
+                    unsafe {
+                        *partials[worker_id].0.get() = Some(acc);
+                    }
+                });
             }
-            partials.write(chunk_index, acc);
-        });
-    }
 
-    executor.run(&flow).wait()?;
-    drop(flow);
+            tg.corun()?;
 
-    Ok((0..num_chunks).fold(init, |acc, chunk_index| {
-        reduce(acc, partials.take(chunk_index))
-    }))
+            // Combine all partials (single-threaded, no atomics needed)
+            let partials = Arc::try_unwrap(partials).unwrap_or_else(|_| {
+                panic!("all partials references should be dropped after task completion")
+            });
+
+            let mut result = init;
+            for slot in partials {
+                if let Some(partial) = slot.0.into_inner() {
+                    result = reduce_fn(result, partial);
+                }
+            }
+            Ok(result)
+        })
+        .wait()
+        .and_then(|inner| inner)
 }
 
 /// Parallel reduce with dynamic partitioning for better load balancing.
@@ -137,7 +207,9 @@ where
     }
 
     let workers = executor.num_workers().max(1);
-    if input.len() <= workers.saturating_mul(REDUCE_SEQUENTIAL_CUTOFF_PER_WORKER) {
+    let len = input.len();
+
+    if len <= workers.saturating_mul(REDUCE_SEQUENTIAL_CUTOFF_PER_WORKER) {
         let mut iter = input.iter().cloned();
         let first = iter
             .next()
@@ -146,49 +218,79 @@ where
         return Ok(reduce(init, partial));
     }
 
-    let flow = Flow::new();
-    let reduce = Arc::new(reduce);
+    let w = workers;
 
-    // Shared state for dynamic partitioning
-    let state = Arc::new(PartitionState::new(input.len()));
-    let partitioner = Arc::new(DynamicPartitioner::new(chunk_size));
+    // Cache-line padded partial results to avoid false sharing
+    #[repr(align(64))]
+    struct CacheLine<T>(UnsafeCell<Option<T>>);
 
-    // Track how many partials have been written
-    let partial_count = Arc::new(AtomicUsize::new(0));
-    // Pre-allocate space for partials (worst case: input.len() / chunk_size + workers)
-    let max_partials = (input.len() / chunk_size).max(1) + workers;
-    let partials = Arc::new(WriteOnceBuffer::new(max_partials));
+    unsafe impl<T: Send> Send for CacheLine<T> {}
+    unsafe impl<T: Send> Sync for CacheLine<T> {}
 
-    // Spawn worker tasks
-    for _ in 0..workers {
-        let input = Arc::clone(&input);
-        let partials = Arc::clone(&partials);
-        let reduce = Arc::clone(&reduce);
-        let state = Arc::clone(&state);
-        let partitioner = Arc::clone(&partitioner);
-        let partial_count = Arc::clone(&partial_count);
+    let root_executor = executor.clone();
+    executor
+        .async_task(move || {
+            let partials: Arc<Vec<CacheLine<T>>> = Arc::new(
+                (0..w)
+                    .map(|_| CacheLine(UnsafeCell::new(None)))
+                    .collect(),
+            );
 
-        flow.spawn(move || {
-            // Keep claiming chunks until exhausted
-            while let Some(chunk) = partitioner.next_chunk(&state) {
-                let mut iter = chunk.start..chunk.end;
-                if let Some(first) = iter.next() {
-                    let mut acc = input[first].clone();
-                    for index in iter {
-                        acc = reduce(acc, input[index].clone());
+            let reduce_fn = Arc::new(reduce);
+            let state = Arc::new(PartitionState::new(len));
+            let partitioner = Arc::new(DynamicPartitioner::new(chunk_size));
+
+            let tg = root_executor.task_group();
+
+            for worker_id in 0..w {
+                let input = Arc::clone(&input);
+                let partials = Arc::clone(&partials);
+                let reduce_fn = Arc::clone(&reduce_fn);
+                let state = Arc::clone(&state);
+                let partitioner = Arc::clone(&partitioner);
+
+                tg.silent_async(move || {
+                    // Keep claiming chunks until exhausted
+                    while let Some(chunk) = partitioner.next_chunk(&state) {
+                        let mut iter = chunk.start..chunk.end;
+                        if let Some(first) = iter.next() {
+                            let mut acc = input[first].clone();
+                            for index in iter {
+                                acc = reduce_fn(acc, input[index].clone());
+                            }
+
+                            // Accumulate into this worker's slot
+                            unsafe {
+                                let slot = &partials[worker_id];
+                                match *slot.0.get() {
+                                    Some(ref existing) => {
+                                        *slot.0.get() = Some(reduce_fn(existing.clone(), acc));
+                                    }
+                                    None => {
+                                        *slot.0.get() = Some(acc);
+                                    }
+                                }
+                            }
+                        }
                     }
-                    // Write partial result
-                    let partial_index = partial_count.fetch_add(1, Ordering::AcqRel);
-                    partials.write(partial_index, acc);
+                });
+            }
+
+            tg.corun()?;
+
+            // Combine all partials (single-threaded, no atomics needed)
+            let partials = Arc::try_unwrap(partials).unwrap_or_else(|_| {
+                panic!("all partials references should be dropped after task completion")
+            });
+
+            let mut result = init;
+            for slot in partials {
+                if let Some(partial) = slot.0.into_inner() {
+                    result = reduce_fn(result, partial);
                 }
             }
-        });
-    }
-
-    executor.run(&flow).wait()?;
-    drop(flow);
-
-    // Combine all partials
-    let num_partials = partial_count.load(Ordering::Acquire);
-    Ok((0..num_partials).fold(init, |acc, index| reduce(acc, partials.take(index))))
+            Ok(result)
+        })
+        .wait()
+        .and_then(|inner| inner)
 }
