@@ -36,20 +36,55 @@
 
 ## 第二轮优化方案
 
-### 实施顺序
+### 当前状态更新（2026-04-06）
+
+已进入主线并通过 `cargo test -p flow-core` 的项：
+
+- 优化A：`PipelineRunState` 合并本地 stop/abort flags，serial stage 使用自适应退避
+- 优化B：`RuntimeJoinScope` 改为 `OnceLock` 惰性分配
+- 优化D1/D2（安全子集）：`GraphSnapshot` 缓存 `initial_pending`，小型无条件图走栈上 fast path
+- 额外已完成项：`TaskGroup` 独立 child fast path、惰性 state、batch `active_runs` 记账，以及对应的 `wait_for_all`/cancel 回归测试
+
+最近几轮单项 benchmark 的方向性结论：
+
+- `fibonacci` 已从最早的 `12.4x` 明显下降到约 `3.0x-3.5x` 区间，说明递归 task orchestration 的主损耗已经被压掉一大截
+- `data_pipeline` / `linear_pipeline` / `graph_pipeline` 仍然稳定偏红，说明当前主瓶颈已回到 pipeline serial-stage 协调和通用 DAG 调度，而不是 `TaskGroup`
+- `runtime child` 的 batch `active_runs` 记账尝试对 pipeline 没有明确收益，已撤回；`TaskGroup` 侧的 batch 记账保留
+
+### 剩余任务优先级（更新）
 
 ```
-Phase 1 (低风险快速收益):
-  ├── 优化A: Pipeline SpinLock 自适应退避
-  └── 优化B: RuntimeJoinScope 延迟分配
+P0: 固化当前基线
+  └── 保持 TaskGroup/graph/runtime 已验证优化，后续 pipeline 实验不得回滚这些收益
 
-Phase 2 (中等复杂度):
-  ├── 优化C: Pipeline line runner 协作式调度
-  └── 优化D: 内联 graph 执行路径优化
+P1: Pipeline 主线热点（最高优先级）
+  ├── 先做证据收集：stage lock 竞争 vs corun_children 等待，到底谁更贵
+  ├── 若 stage lock 更贵：优先推进优化A后续/serial-stage 协调路径
+  └── 若等待更贵：优先推进优化E的受控版本（先短等待，再决定是否做完整协议改写）
 
-Phase 3 (架构级):
-  └── 优化E: corun_children 事件通知替代轮询
+P2: 通用 DAG 调度热路径
+  ├── 目标 case：graph_pipeline, wavefront
+  └── 聚焦 successor ready 调度、pending/reset、continuation/批量入队路径
+
+P3: Flow build / snapshot 成本
+  ├── 目标 case：thread_pool, linear_chain
+  └── 在不碰 pipeline 语义的前提下处理构图和快照开销
+
+P4: corun_children 完整等待协议改写（独立分支）
+  └── 只有在 P1 证据明确指向等待协议，且轻量版本收益不足时才进入主线候选
+
+P5: 低收益或高风险候选（默认暂停）
+  ├── 优化C1：line runner 启动瘦身，收益太小，暂不主推
+  ├── 优化C3：token stride / 去中心化发 token，语义风险过高
+  └── 继续深挖 TaskGroup 微优化，边际收益已明显下降
 ```
+
+### 执行原则（更新）
+
+- 接下来的主线工作默认围绕 `Pipeline` 与通用 DAG 调度，不再把 `TaskGroup` 当成第一优先级
+- 所有新的 pipeline 改动都必须先保住现有 token 语义：`PipeContext.token()` 全局单调、`stop()` 边界不变、`num_tokens()` 准确
+- `优化E` 不再默认作为“第三阶段必做项”，而是改为证据驱动的候选分支
+- `TaskGroup`/runtime 方向若继续推进，只能作为补充项，不能阻塞 pipeline 主线
 
 ### 本轮边界与执行约束
 
