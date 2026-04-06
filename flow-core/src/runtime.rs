@@ -1,10 +1,12 @@
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, OnceLock};
+use std::time::Instant;
 
 use crate::async_handle::{AsyncHandle, RuntimeAsyncState};
 use crate::error::FlowError;
 use crate::executor::{Executor, RunHandle};
 use crate::flow::{Flow, TaskHandle, TaskId};
+use crate::perf::PipelineProfileState;
 use crate::task_group::TaskGroup;
 
 type RuntimeScheduler = Arc<dyn Fn(TaskId) + Send + Sync + 'static>;
@@ -181,14 +183,42 @@ impl RuntimeCtx {
         );
     }
 
+    pub(crate) fn silent_result_async_global<F>(&self, task: F)
+    where
+        F: FnOnce(&RuntimeCtx) -> Result<(), FlowError> + Send + 'static,
+    {
+        let join_scope = Arc::clone(self.ensure_join_scope());
+        // Pipeline line runners benefit from being immediately stealable by any worker
+        // instead of sticking to the parent worker's local queue.
+        self.executor.schedule_runtime_silent_child_global(
+            Box::new(task),
+            Arc::clone(&self.cancelled),
+            join_scope,
+        );
+    }
+
     pub fn corun_children(&self) -> Result<(), FlowError> {
+        self.corun_children_profiled(None)
+    }
+
+    pub(crate) fn corun_children_profiled(
+        &self,
+        profile: Option<&PipelineProfileState>,
+    ) -> Result<(), FlowError> {
         let Some(join_scope) = self.join_scope.get() else {
             return Ok(());
         };
 
         if !join_scope.is_idle() {
-            self.executor
-                .wait_until_inline(self.worker_id, || join_scope.is_idle());
+            let wait_started = profile.map(|_| Instant::now());
+            self.executor.wait_until_inline_profiled(
+                self.worker_id,
+                || join_scope.is_idle(),
+                profile,
+            );
+            if let (Some(profile), Some(wait_started)) = (profile, wait_started) {
+                profile.record_corun_total_wait(wait_started.elapsed());
+            }
         }
 
         join_scope.take_error().map_or(Ok(()), Err)

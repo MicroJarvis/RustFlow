@@ -4,7 +4,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use flow_core::{Executor, Flow, FlowError};
 
 use crate::parallel_for::{ParallelForOptions, chunk_ranges_aligned_to_workers};
-use crate::partitioner::{DynamicPartitioner, Partitioner, PartitionState};
+use crate::partitioner::{DynamicPartitioner, PartitionState, Partitioner};
 use crate::write_once_buffer::WriteOnceBuffer;
 
 const TRANSFORM_SEQUENTIAL_CUTOFF_PER_WORKER: usize = 8_192;
@@ -190,7 +190,5 @@ where
 
     // Combine all partials
     let num_partials = partial_count.load(Ordering::Acquire);
-    Ok((0..num_partials).fold(init, |acc, index| {
-        reduce(acc, partials.take(index))
-    }))
+    Ok((0..num_partials).fold(init, |acc, index| reduce(acc, partials.take(index))))
 }

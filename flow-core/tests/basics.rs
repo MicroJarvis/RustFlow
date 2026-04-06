@@ -2,7 +2,7 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use flow_core::{Executor, Flow};
+use flow_core::{Executor, Flow, FlowProfile};
 
 #[test]
 fn single_task_executes() {
@@ -122,6 +122,117 @@ fn repeated_runs_reuse_the_same_graph() {
         .expect("second run should succeed");
 
     assert_eq!(counter.load(Ordering::SeqCst), 2);
+}
+
+#[test]
+fn repeated_runs_reuse_pending_state_for_dependent_graphs() {
+    let executor = Executor::new(4);
+    let flow = Flow::new();
+    let phase = Arc::new(AtomicUsize::new(0));
+    let sink = Arc::new(Mutex::new(Vec::new()));
+
+    let root = flow.placeholder();
+    let left = {
+        let phase = Arc::clone(&phase);
+        let sink = Arc::clone(&sink);
+        flow.spawn(move || {
+            let run = phase.load(Ordering::SeqCst);
+            sink.lock().expect("sink poisoned").push((run, "left"));
+        })
+    };
+    let right = {
+        let phase = Arc::clone(&phase);
+        let sink = Arc::clone(&sink);
+        flow.spawn(move || {
+            let run = phase.load(Ordering::SeqCst);
+            sink.lock().expect("sink poisoned").push((run, "right"));
+        })
+    };
+    let join = {
+        let phase = Arc::clone(&phase);
+        let sink = Arc::clone(&sink);
+        flow.spawn(move || {
+            let run = phase.load(Ordering::SeqCst);
+            let seen = sink.lock().expect("sink poisoned");
+            let branch_hits = seen.iter().filter(|(phase, _)| *phase == run).count();
+            assert_eq!(branch_hits, 2, "join should observe both branches in run {run}");
+        })
+    };
+
+    root.precede([left.clone(), right.clone()]);
+    join.succeed([left, right]);
+
+    for run in 0..2 {
+        phase.store(run, Ordering::SeqCst);
+        executor
+            .run(&flow)
+            .wait()
+            .expect("dependent graph run should succeed");
+    }
+
+    let sink = sink.lock().expect("sink poisoned");
+    assert_eq!(sink.len(), 4);
+    for run in 0..2 {
+        let mut labels = sink
+            .iter()
+            .filter_map(|(phase, label)| (*phase == run).then_some(*label))
+            .collect::<Vec<_>>();
+        labels.sort_unstable();
+        assert_eq!(labels, vec!["left", "right"]);
+    }
+}
+
+#[test]
+fn flow_profile_records_snapshot_and_graph_activity() {
+    let executor = Executor::new(4);
+    let flow = Flow::new();
+
+    let root = flow.placeholder();
+    let left = flow.spawn(|| {}).name("left");
+    let right = flow.spawn(|| {}).name("right");
+    let join = flow.spawn(|| {}).name("join");
+
+    root.precede([left.clone(), right.clone()]);
+    join.succeed([left, right]);
+
+    flow.set_profile_enabled(true);
+    executor
+        .run(&flow)
+        .wait()
+        .expect("profiled flow run should succeed");
+
+    let first = flow.last_profile();
+    assert!(!first.is_empty(), "profile should capture flow activity");
+    assert_eq!(first.snapshot_cache_misses, 1);
+    assert_eq!(first.snapshot_cache_hits, 0);
+    assert_eq!(first.snapshot_nodes, 4);
+    assert_eq!(first.snapshot_roots, 1);
+    assert_eq!(first.graph_root_tasks, 1);
+    assert_eq!(first.graph_tasks_executed, 4);
+    assert_eq!(first.graph_pending_decrements, 4);
+    assert_eq!(first.graph_ready_successors, 3);
+    assert!(
+        first.graph_continuations > 0
+            || first.graph_local_enqueues > 0
+            || first.graph_global_enqueues > 0,
+        "profile should capture either continuation reuse or queue traffic: {first}"
+    );
+
+    executor
+        .run(&flow)
+        .wait()
+        .expect("second profiled flow run should succeed");
+    let second = flow.last_profile();
+    assert_eq!(second.snapshot_cache_hits, 1);
+    assert_eq!(second.snapshot_cache_misses, 0);
+    assert_eq!(second.graph_tasks_executed, 4);
+
+    flow.set_profile_enabled(false);
+    executor
+        .run(&flow)
+        .wait()
+        .expect("non-profiled flow run should still succeed");
+    assert_eq!(flow.last_profile(), FlowProfile::default());
 }
 
 #[test]

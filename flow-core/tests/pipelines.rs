@@ -2,7 +2,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use flow_core::{Executor, Pipe, Pipeline};
+use flow_core::{Executor, Pipe, Pipeline, PipelineProfile};
 
 #[test]
 fn linear_pipeline_processes_tokens_until_stop() {
@@ -225,4 +225,56 @@ fn pipeline_can_be_reset_and_reused() {
 
     let seen = seen.lock().expect("seen poisoned");
     assert_eq!(seen.as_slice(), &[0, 1, 2, 0, 1, 2]);
+}
+
+#[test]
+fn pipeline_profile_records_serial_lock_and_corun_wait_activity() {
+    let executor = Executor::new(4);
+    let pipeline = Pipeline::from_pipes(
+        4,
+        vec![
+            Pipe::serial(|ctx| {
+                if ctx.token() == 12 {
+                    ctx.stop();
+                    return;
+                }
+                std::thread::sleep(Duration::from_millis(1));
+            }),
+            Pipe::serial(|_| {
+                std::thread::sleep(Duration::from_millis(1));
+            }),
+            Pipe::serial(|_| {
+                std::thread::sleep(Duration::from_millis(1));
+            }),
+        ],
+    );
+
+    pipeline.set_profile_enabled(true);
+    pipeline
+        .run(&executor)
+        .wait()
+        .expect("profiled pipeline run should succeed");
+
+    let profile = pipeline.last_profile();
+    assert!(!profile.is_empty(), "profile should capture some activity");
+    assert!(
+        profile.stage0_contended_acquires > 0
+            || profile.downstream_contended_acquires > 0
+            || profile.corun_idle_spins > 0
+            || profile.corun_inline_executions > 0,
+        "profile should record either serial-stage contention or corun wait activity: {profile}"
+    );
+    assert!(
+        profile.corun_total_wait_ns > 0
+            || profile.stage0_contended_acquires > 0
+            || profile.downstream_contended_acquires > 0,
+        "profile should capture either corun wait or serial-stage coordination: {profile}"
+    );
+
+    pipeline.set_profile_enabled(false);
+    pipeline
+        .run(&executor)
+        .wait()
+        .expect("non-profiled pipeline run should still succeed");
+    assert_eq!(pipeline.last_profile(), PipelineProfile::default());
 }

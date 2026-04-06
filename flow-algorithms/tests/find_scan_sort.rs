@@ -36,8 +36,8 @@ fn assert_parallel_sort_by_matches_oracles<F>(
     let mut expected_rayon = input.clone();
     expected_rayon.par_sort_unstable_by(compare);
 
-    let output =
-        parallel_sort_by(&executor, input, options, compare).expect("parallel sort by should succeed");
+    let output = parallel_sort_by(&executor, input, options, compare)
+        .expect("parallel sort by should succeed");
 
     assert_eq!(output, expected_std);
     assert_eq!(output, expected_rayon);
@@ -224,12 +224,8 @@ fn parallel_sort_large_matches_std_sort() {
     let mut expected = input.clone();
     expected.sort_unstable();
 
-    let output = parallel_sort(
-        &executor,
-        input,
-        ParallelForOptions::default(),
-    )
-    .expect("large parallel sort should succeed");
+    let output = parallel_sort(&executor, input, ParallelForOptions::default())
+        .expect("large parallel sort should succeed");
 
     assert_eq!(output, expected);
 }
@@ -242,9 +238,7 @@ fn parallel_sort_preserves_sorted_input_on_parallel_path() {
 
 #[test]
 fn parallel_sort_handles_reverse_sorted_input_on_parallel_path() {
-    let input = (0..PARALLEL_SORT_TEST_LEN as i32)
-        .rev()
-        .collect::<Vec<_>>();
+    let input = (0..PARALLEL_SORT_TEST_LEN as i32).rev().collect::<Vec<_>>();
     assert_parallel_sort_matches_oracles(input, ParallelForOptions::default());
 }
 
@@ -263,6 +257,14 @@ fn parallel_sort_handles_all_equal_input_on_parallel_path() {
 }
 
 #[test]
+fn parallel_sort_handles_sorted_duplicate_runs_on_parallel_path() {
+    let input = (0..PARALLEL_SORT_TEST_LEN)
+        .map(|index| (index / 97) as i32)
+        .collect::<Vec<_>>();
+    assert_parallel_sort_matches_oracles(input, ParallelForOptions::default());
+}
+
+#[test]
 fn parallel_sort_handles_nearly_sorted_input_on_parallel_path() {
     let mut input = (0..PARALLEL_SORT_TEST_LEN as i32).collect::<Vec<_>>();
     for offset in (0..PARALLEL_SORT_TEST_LEN.saturating_sub(17)).step_by(4096) {
@@ -276,11 +278,9 @@ fn parallel_sort_by_matches_descending_oracles_on_parallel_path() {
     let input = (0..PARALLEL_SORT_TEST_LEN)
         .map(|index| ((index as i32 * 37) % 10_007) - 5_000)
         .collect::<Vec<_>>();
-    assert_parallel_sort_by_matches_oracles(
-        input,
-        ParallelForOptions::default(),
-        |left, right| right.cmp(left),
-    );
+    assert_parallel_sort_by_matches_oracles(input, ParallelForOptions::default(), |left, right| {
+        right.cmp(left)
+    });
 }
 
 #[test]
@@ -288,9 +288,7 @@ fn parallel_sort_by_matches_descending_oracles_for_duplicate_heavy_input() {
     let input = (0..PARALLEL_SORT_TEST_LEN)
         .map(|index| (index % 9) as i32)
         .collect::<Vec<_>>();
-    assert_parallel_sort_by_matches_oracles(
-        input,
-        ParallelForOptions::default(),
-        |left, right| right.cmp(left),
-    );
+    assert_parallel_sort_by_matches_oracles(input, ParallelForOptions::default(), |left, right| {
+        right.cmp(left)
+    });
 }

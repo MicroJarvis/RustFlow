@@ -269,11 +269,11 @@ Current highest-value observations:
 - Outcome:
   - benchmark harness was also corrected so RustFlow no longer times random input generation in `scan`/`sort`, matching Taskflow's timing scope more closely
   - `scan` looks effectively recovered after the timing fix and scan flattening:
-    - 5-round recheck `@10000`: `0.018 ms / 0.819x`
-    - 5-round recheck `@100000`: `0.110 ms / 1.072x`
+    - 5-round recheck `@10000`: `0.018 ms / 0.884x`
+    - 5-round recheck `@100000`: `0.112 ms / 1.096x`
   - `sort` improved materially but is still behind at the largest point:
-    - 5-round recheck `@10000`: `0.084 ms / 0.818x`
-    - 5-round recheck `@100000`: `1.067 ms / 1.763x`
+    - 5-round recheck `@10000`: `0.071 ms / 0.769x`
+    - 5-round recheck `@100000`: `0.949 ms / 1.554x`
   - `primes` and `reduce_sum` were not the main target of this task and remained noisy across short runs
   - Task 5 should now focus on `sort`, not `scan`
 
@@ -314,6 +314,20 @@ Current highest-value observations:
 
 - `data_pipeline` and `graph_pipeline` both improve materially.
 - `linear_pipeline` does not regress.
+
+**Current status (2026-04-05):**
+
+- Implemented:
+  - switched pipeline token count state from `Mutex<usize>` to `AtomicUsize` to reduce run/reset/read bookkeeping cost
+- Tried and reverted:
+  - line-worker scheduling via `TaskGroup` in `run_pipe_chain`/`run_data_chain` caused token-accounting regressions in `scalable_data_pipelines` tests (off-by-one token count); reverted to stable `silent_result_async + corun_children`
+- Verification:
+  - `cargo test -p flow-core --test pipelines -- --nocapture`
+  - `cargo test -p flow-core --test scalable_data_pipelines -- --nocapture`
+  - `cargo run -p benchmarks --release --bin taskflow_compare -- --threads 4 --rounds 3 --cases data_pipeline,graph_pipeline,linear_pipeline --output-dir benchmarks/reports/taskflow_compare/post_lockfree_queue_task6`
+- Outcome:
+  - no clear material win on Task 6 targets yet; ratios remain in roughly the same range and are noisy across short runs
+  - keep current semantics-safe implementation and continue with more targeted hot-path work
 
 ## Reporting Cadence
 

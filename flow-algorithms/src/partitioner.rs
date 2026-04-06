@@ -5,8 +5,8 @@
 //! - `DynamicPartitioner`: Atomic fetch_add for work-stealing style
 //! - `GuidedPartitioner`: Decreasing chunk sizes for balanced completion
 
-use std::sync::atomic::{AtomicUsize, Ordering};
 use std::ops::Range;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 /// State shared across all workers for partitioning.
 pub struct PartitionState {

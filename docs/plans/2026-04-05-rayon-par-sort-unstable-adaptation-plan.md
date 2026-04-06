@@ -50,146 +50,90 @@ Current observations:
 - Do not add special-case SIMD or radix sort paths in the first pass.
 - Do not introduce type-specific fast paths before the generic path is correct and benchmarked.
 
-## Task 1: Lock Down Correctness Coverage For Sort Shapes
+## Status As Of 2026-04-05
+
+Completed in commit `00c9303` (`refactor: prepare parallel sort for rayon-style rewrite`):
+
+- Task 1: expanded `parallel_sort` / `parallel_sort_by` correctness coverage in `flow-algorithms/tests/find_scan_sort.rs`
+- Task 2: refactored the internal sort entry to use a Rayon-style `is_less` comparator path and dedicated runtime sort entry points
+- Task 3: added insertion-sort, partial-insertion-sort, heapsort, and bad-partition-budget scaffolding in `flow-algorithms/src/find_scan_sort.rs`
+
+Verification already completed for the landed batch:
+
+- `cargo test -p flow-algorithms --test find_scan_sort -- --nocapture`
+
+Important current state:
+
+- The sort execution skeleton is now prepared for a Rayon-style rewrite.
+- The main recursive partitioning path still uses `select_nth_unstable_by`.
+- The new helper/fallback building blocks are present but not yet wired into the main partition logic.
+
+## Completed Task 1: Lock Down Correctness Coverage For Sort Shapes
 
 **Files:**
 - Modify: `flow-algorithms/tests/find_scan_sort.rs`
 - Verify: `flow-algorithms/src/find_scan_sort.rs`
 
-**Step 1: Add failing or currently-missing tests for difficult sort shapes**
+Completed work:
 
-Add tests covering:
+- added large-input tests covering:
+  - already sorted input
+  - reverse-sorted input
+  - duplicate-heavy input
+  - all-equal input
+  - nearly sorted input
+- added `parallel_sort_by` descending-order oracle tests
+- used both `sort_unstable` and Rayon `par_sort_unstable` / `par_sort_unstable_by` as correctness oracles
+- kept Rayon restricted to `dev-dependencies`
 
-- already sorted input
-- reverse-sorted input
-- heavily duplicated input
-- all-equal input
-- near-sorted input with a few local inversions
-
-Use `parallel_sort` and `parallel_sort_by`, and compare with `sort_unstable` / `sort_unstable_by`.
-
-**Step 2: Run the targeted test file**
-
-Run:
+Verification run:
 
 ```bash
 cargo test -p flow-algorithms --test find_scan_sort -- --nocapture
 ```
 
-Expected:
-
-- PASS if coverage is additive only
-- otherwise fail in a way that reveals current sort edge-case bugs before the algorithm rewrite
-
-**Step 3: Commit**
-
-```bash
-git add flow-algorithms/tests/find_scan_sort.rs
-git commit -m "test: expand parallel sort coverage for hard input shapes"
-```
-
-## Task 2: Introduce A Rayon-Style Internal Sort Skeleton
+## Completed Task 2: Introduce A Rayon-Style Internal Sort Skeleton
 
 **Files:**
 - Modify: `flow-algorithms/src/find_scan_sort.rs`
 - Verify: `flow-algorithms/tests/find_scan_sort.rs`
 
-**Step 1: Add an internal comparator adapter**
+Completed work:
 
-Introduce a local `is_less` style adapter so the internal sorter can work with `Fn(&T, &T) -> bool` rather than repeatedly comparing `Ordering::Less`.
+- introduced a local `is_less` comparator adapter for the internal sort path
+- split the top-level entry into a dedicated runtime sort entry plus internal quicksort-style loop
+- preserved the runtime-child execution shape:
+  - spawn one side with `RuntimeCtx::silent_async`
+  - iterate on the other side
+  - call `runtime.corun_children()` once at the end
+- kept the public `parallel_sort` / `parallel_sort_by` API unchanged
 
-Target shape:
-
-```rust
-let is_less = Arc::new(move |a: &T, b: &T| compare(a, b) == Ordering::Less);
-```
-
-Keep the public `parallel_sort_by` API unchanged.
-
-**Step 2: Split the top-level sort into sequential gate plus internal parallel entry**
-
-Refactor `parallel_sort_by` so it:
-
-- computes worker count and sequential cutoff
-- chooses the sequential path for tiny inputs
-- otherwise enters a dedicated internal quicksort function
-
-Do not port pdqsort behavior yet in this step; only make the call graph ready.
-
-**Step 3: Keep runtime recursion as the execution shape**
-
-Retain the current best structure:
-
-- spawn one side with `RuntimeCtx::silent_async`
-- iterate on the other side in a loop
-- call `runtime.corun_children()` once at the end
-
-**Step 4: Run the sort test file**
-
-Run:
+Verification run:
 
 ```bash
 cargo test -p flow-algorithms --test find_scan_sort -- --nocapture
 ```
 
-Expected: PASS
-
-**Step 5: Commit**
-
-```bash
-git add flow-algorithms/src/find_scan_sort.rs flow-algorithms/tests/find_scan_sort.rs
-git commit -m "refactor: prepare parallel sort for rayon-style pdqsort core"
-```
-
-## Task 3: Port The Small-Partition Building Blocks
+## Completed Task 3: Port The Small-Partition Building Blocks
 
 **Files:**
 - Modify: `flow-algorithms/src/find_scan_sort.rs`
 - Verify: `flow-algorithms/tests/find_scan_sort.rs`
 
-**Step 1: Add insertion-sort helpers**
+Completed work:
 
-Port or adapt the minimal helpers needed for small partitions:
+- added insertion sort helpers for short partitions
+- added bounded partial insertion sort scaffolding for nearly sorted partitions
+- added heapsort fallback helper and bad-partition budget initialization
+- left these helpers staged for integration into the main partitioning path in the next task
 
-- insertion of head/tail
-- insertion sort for short slices
-
-Keep them private to `find_scan_sort.rs`.
-
-**Step 2: Add partial insertion sort**
-
-Introduce a bounded `partial_insertion_sort` helper for nearly sorted partitions.
-
-Expected use:
-
-- when partitioning reports the slice was already almost partitioned
-- as an early exit before deeper recursion
-
-**Step 3: Add heapsort fallback helper**
-
-Introduce a private heapsort fallback and a recursion-budget / bad-partition counter.
-
-Goal:
-
-- guarantee worst-case behavior
-- match Rayon/`pdqsort` shape more closely than the current median-selection recursion
-
-**Step 4: Run tests**
-
-Run:
+Verification run:
 
 ```bash
 cargo test -p flow-algorithms --test find_scan_sort -- --nocapture
 ```
 
-Expected: PASS
-
-**Step 5: Commit**
-
-```bash
-git add flow-algorithms/src/find_scan_sort.rs flow-algorithms/tests/find_scan_sort.rs
-git commit -m "feat: add pdqsort small-partition and fallback helpers"
-```
+## Remaining Tasks
 
 ## Task 4: Replace `select_nth_unstable_by` With Explicit Pivot + Partition
 
@@ -382,11 +326,10 @@ git commit -m "docs: record rayon-style parallel sort adaptation results"
 
 ## Recommended Execution Order
 
-1. Land Task 1 first so the rewrite has edge-case protection.
-2. Land Task 2 before any algorithm port, so the internal API is clean.
-3. Land Tasks 3 and 4 as separate commits if possible.
-4. Treat Task 5 as benchmark-guided tuning, not open-ended experimentation.
-5. Only move to pipeline work after Task 6 confirms the sort rewrite is a real win.
+1. Task 4: replace `select_nth_unstable_by` with explicit pivot selection and partitioning.
+2. Task 5: tune thresholds only after Task 4 lands and tests are green.
+3. Task 6: run broader regression checks and capture targeted benchmark results.
+4. Task 7: update progress docs with before/after benchmark numbers and remaining gaps.
 
 ## Exit Criteria
 
@@ -399,4 +342,3 @@ git commit -m "docs: record rayon-style parallel sort adaptation results"
 - `cargo test -p flow-algorithms --test find_scan_sort -- --nocapture` passes.
 - `cargo test -p flow-core --test runtimes -- --nocapture` passes.
 - `sort @100000` improves materially from the current `~1.54x` ratio band.
-

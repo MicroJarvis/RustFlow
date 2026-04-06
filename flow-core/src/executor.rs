@@ -4,6 +4,7 @@ use std::panic::{self, AssertUnwindSafe};
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU32, AtomicUsize, Ordering, fence};
 use std::sync::{Arc, Condvar, Mutex, OnceLock, RwLock};
 use std::thread::{self, JoinHandle};
+use std::time::{Duration, Instant};
 
 use crossbeam_deque::{Injector, Steal, Stealer, Worker};
 
@@ -11,6 +12,7 @@ use crate::async_handle::{AsyncHandle, AsyncState, RuntimeAsyncState};
 use crate::error::FlowError;
 use crate::flow::{Flow, GraphSnapshot, NodeSnapshot, Subflow, TaskId, TaskKind};
 use crate::observer::Observer;
+use crate::perf::{FlowProfile, FlowProfileState, PipelineProfileState};
 use crate::runtime::{RuntimeCtx, RuntimeJoinScope};
 use crate::task_group::{TaskGroup, TaskGroupState};
 use crate::util::WaitBackoff;
@@ -243,7 +245,8 @@ impl Executor {
     }
 
     pub fn run(&self, flow: &Flow) -> RunHandle {
-        self.start_run(flow.snapshot(), None)
+        let (snapshot, profile, profile_slot) = flow.snapshot_for_run();
+        self.start_run(snapshot, None, profile, profile_slot)
     }
 
     pub fn run_n(&self, flow: &Flow, n: usize) -> RunHandle {
@@ -433,7 +436,8 @@ impl Executor {
     }
 
     pub(crate) fn corun_inline(&self, flow: &Flow, worker_id: usize) -> Result<(), FlowError> {
-        let handle = self.start_run(flow.snapshot(), Some(worker_id));
+        let (snapshot, profile, profile_slot) = flow.snapshot_for_run();
+        let handle = self.start_run(snapshot, Some(worker_id), profile, profile_slot);
         self.wait_handle_inline(&handle, worker_id)
     }
 
@@ -459,11 +463,22 @@ impl Executor {
         Ok(())
     }
 
-    pub(crate) fn wait_until_inline<F>(&self, worker_id: usize, mut done: F)
+    pub(crate) fn wait_until_inline<F>(&self, worker_id: usize, done: F)
     where
         F: FnMut() -> bool,
     {
-        self.drive_worker_until(worker_id, DriveMode::NoPark, &mut done);
+        self.wait_until_inline_profiled(worker_id, done, None);
+    }
+
+    pub(crate) fn wait_until_inline_profiled<F>(
+        &self,
+        worker_id: usize,
+        mut done: F,
+        profile: Option<&PipelineProfileState>,
+    ) where
+        F: FnMut() -> bool,
+    {
+        self.drive_worker_until(worker_id, DriveMode::NoPark, &mut done, profile);
     }
 
     pub(crate) fn schedule_runtime_runner(
@@ -473,23 +488,39 @@ impl Executor {
         self.schedule_async_runner(runner, None)
     }
 
-    fn start_run(&self, snapshot: Arc<GraphSnapshot>, worker_hint: Option<usize>) -> RunHandle {
+    fn start_run(
+        &self,
+        snapshot: Arc<GraphSnapshot>,
+        worker_hint: Option<usize>,
+        profile: Option<Arc<FlowProfileState>>,
+        profile_slot: Option<Arc<Mutex<FlowProfile>>>,
+    ) -> RunHandle {
         let handle = RunHandle::pending();
 
         if snapshot.nodes.is_empty() {
+            Self::commit_flow_profile(profile, profile_slot, Duration::ZERO);
             handle.complete(Ok(()));
             return handle;
         }
 
         self.inner.increment_active_runs();
 
-        let run = Arc::new(RunState::new(snapshot, handle.clone()));
+        let run = Arc::new(RunState::new(snapshot, handle.clone(), profile, profile_slot));
         let root_indices = run.root_indices();
 
         if root_indices.is_empty() {
             self.inner.decrement_active_runs();
+            Self::commit_flow_profile(
+                run.profile.clone(),
+                run.profile_slot.clone(),
+                run.started_at.map_or(Duration::ZERO, |started_at| started_at.elapsed()),
+            );
             handle.complete(Ok(()));
             return handle;
+        }
+
+        if let Some(profile) = run.profile.as_deref() {
+            profile.record_graph_root_tasks(root_indices.len() as u64);
         }
 
         run.outstanding
@@ -518,6 +549,17 @@ impl Executor {
         handle
     }
 
+    fn commit_flow_profile(
+        profile: Option<Arc<FlowProfileState>>,
+        profile_slot: Option<Arc<Mutex<FlowProfile>>>,
+        elapsed: Duration,
+    ) {
+        if let (Some(profile), Some(profile_slot)) = (profile, profile_slot) {
+            profile.record_run_completed(elapsed);
+            *profile_slot.lock().expect("flow profile poisoned") = profile.snapshot();
+        }
+    }
+
     pub(crate) fn schedule_async_runner(
         &self,
         runner: Box<dyn FnOnce(&RuntimeCtx) -> Result<(), FlowError> + Send + 'static>,
@@ -539,6 +581,22 @@ impl Executor {
             ScheduledAsyncTask::runtime_child(runner, runtime_cancelled, join_scope),
             worker_hint,
         );
+    }
+
+    pub(crate) fn schedule_runtime_silent_child_global(
+        &self,
+        runner: Box<dyn FnOnce(&RuntimeCtx) -> Result<(), FlowError> + Send + 'static>,
+        runtime_cancelled: Arc<AtomicBool>,
+        join_scope: Arc<RuntimeJoinScope>,
+    ) {
+        let _ = join_scope.add_child();
+        self.inner.increment_active_runs();
+        self.inner
+            .enqueue_async_global(ScheduledAsyncTask::runtime_child(
+                runner,
+                runtime_cancelled,
+                join_scope,
+            ));
     }
 
     pub(crate) fn schedule_task_group_child(
@@ -590,8 +648,13 @@ impl Executor {
         handle
     }
 
-    fn drive_worker_until<F>(&self, worker_id: usize, mode: DriveMode, done: &mut F)
-    where
+    fn drive_worker_until<F>(
+        &self,
+        worker_id: usize,
+        mode: DriveMode,
+        done: &mut F,
+        profile: Option<&PipelineProfileState>,
+    ) where
         F: FnMut() -> bool,
     {
         // Resolve the worker reference once to avoid repeated TLS lookups.
@@ -627,6 +690,9 @@ impl Executor {
             let task = continuation.take().or_else(|| find_task(&self.inner));
             if let Some(task) = task {
                 steal_attempts = 0;
+                if let Some(profile) = profile {
+                    profile.record_corun_inline_execution();
+                }
                 continuation = self.inner.execute(self, worker_id, task);
                 continue;
             }
@@ -653,14 +719,21 @@ impl Executor {
                 DriveMode::NoPark => {
                     // Aggressive work-stealing: try multiple times before yielding
                     // This matches Taskflow's _corun_until behavior
+                    let idle_started = profile.map(|_| Instant::now());
                     steal_attempts += 1;
                     if steal_attempts < MAX_STEAL_ATTEMPTS {
                         // Spin and try to steal again
                         std::hint::spin_loop();
+                        if let (Some(profile), Some(idle_started)) = (profile, idle_started) {
+                            profile.record_corun_idle_spin(idle_started.elapsed());
+                        }
                     } else {
                         // Reset counter and yield to allow other threads to run
                         steal_attempts = 0;
                         thread::yield_now();
+                        if let (Some(profile), Some(idle_started)) = (profile, idle_started) {
+                            profile.record_corun_idle_yield(idle_started.elapsed());
+                        }
                     }
                 }
             }
@@ -912,6 +985,9 @@ impl ExecutorInner {
     ) {
         task.run_state().outstanding.fetch_add(1, Ordering::AcqRel);
         if continuation.is_none() {
+            if let Some(profile) = task.run_state().profile.as_deref() {
+                profile.record_graph_continuation();
+            }
             *continuation = Some(ScheduledWork::Graph(task));
         } else {
             self.enqueue_graph(task, worker_hint);
@@ -924,6 +1000,10 @@ impl ExecutorInner {
 
     fn enqueue_async(&self, task: ScheduledAsyncTask, worker_hint: Option<usize>) {
         self.enqueue(ScheduledWork::Async(task), worker_hint);
+    }
+
+    fn enqueue_async_global(&self, task: ScheduledAsyncTask) {
+        self.inject_global(ScheduledWork::Async(task));
     }
 
     fn enqueue_task_group(&self, task: ScheduledTaskGroupChild, worker_hint: Option<usize>) {
@@ -941,6 +1021,7 @@ impl ExecutorInner {
                 // But respect worker_hint if it's different from our worker_id
                 if worker_hint.is_none() || worker_hint == Some(local.worker_id) {
                     if let Some(t) = task_opt.take() {
+                        self.record_enqueued_work(&t, true);
                         local.worker.push(t);
                     }
                 }
@@ -949,20 +1030,27 @@ impl ExecutorInner {
 
         // If not pushed locally, push to injector
         if let Some(task) = task_opt {
-            self.injector.push(task);
+            self.inject_with_hint(task, worker_hint);
+        }
+    }
 
-            // Wake a worker to process the task
-            // Note: wake_worker uses SeqCst load on parker state, which together
-            // with prepare_park's SeqCst fence provides the Dekker-pattern
-            // synchronization needed to prevent missed wakeups.
-            if let Some(target) = worker_hint {
-                let _ = self.wake_worker(target);
-            } else {
-                // Wake any parked worker
-                for worker_id in 0..self.parkers.len() {
-                    if self.wake_worker(worker_id) {
-                        break;
-                    }
+    fn inject_global(&self, task: ScheduledWork) {
+        self.inject_with_hint(task, None);
+    }
+
+    fn inject_with_hint(&self, task: ScheduledWork, worker_hint: Option<usize>) {
+        self.record_enqueued_work(&task, false);
+        self.injector.push(task);
+
+        // Note: wake_worker uses SeqCst load on parker state, which together
+        // with prepare_park's SeqCst fence provides the Dekker-pattern
+        // synchronization needed to prevent missed wakeups.
+        if let Some(target) = worker_hint {
+            let _ = self.wake_worker(target);
+        } else {
+            for worker_id in 0..self.parkers.len() {
+                if self.wake_worker(worker_id) {
+                    break;
                 }
             }
         }
@@ -981,6 +1069,7 @@ impl ExecutorInner {
                 if worker_hint.is_none() || worker_hint == Some(local.worker_id) {
                     if let Some(t) = tasks_opt.take() {
                         for task in t {
+                            self.record_enqueued_work(&task, true);
                             local.worker.push(task);
                         }
                     }
@@ -991,6 +1080,7 @@ impl ExecutorInner {
         // If not pushed locally, push to injector
         if let Some(tasks) = tasks_opt {
             for task in tasks {
+                self.record_enqueued_work(&task, false);
                 self.injector.push(task);
             }
 
@@ -1013,6 +1103,18 @@ impl ExecutorInner {
             waiters.into_iter().map(ScheduledWork::Graph).collect(),
             worker_hint,
         );
+    }
+
+    fn record_enqueued_work(&self, work: &ScheduledWork, local: bool) {
+        if let ScheduledWork::Graph(task) = work {
+            if let Some(profile) = task.run_state().profile.as_deref() {
+                if local {
+                    profile.record_graph_local_enqueue(1);
+                } else {
+                    profile.record_graph_global_enqueue(1);
+                }
+            }
+        }
     }
 
     /// Find a task using the work-stealing pattern:
@@ -1145,8 +1247,12 @@ impl ExecutorInner {
             worker_id,
             Some(scheduler),
             Arc::clone(&run.cancelled),
+            run.profile.as_deref(),
         );
         self.notify_task_finished(worker_id, node);
+        if let Some(profile) = run.profile.as_deref() {
+            profile.record_graph_task_executed();
+        }
 
         if let Err(error) = &selected_successors {
             run.record_error(error.clone());
@@ -1161,6 +1267,9 @@ impl ExecutorInner {
 
         if node.kind.is_condition() {
             if let Ok(Some(successors)) = selected_successors {
+                if let Some(profile) = run.profile.as_deref() {
+                    profile.record_graph_ready_successors(successors.len() as u64);
+                }
                 for successor_position in successors {
                     if let Some(&successor) = node.successors.get(successor_position) {
                         self.schedule_ready_graph(
@@ -1175,10 +1284,15 @@ impl ExecutorInner {
                 }
             }
         } else if selected_successors.is_ok() {
+            let mut ready_successors = 0u64;
+            if let Some(profile) = run.profile.as_deref() {
+                profile.record_graph_pending_decrements(node.successors.len() as u64);
+            }
             for &successor in &node.successors {
                 let previous = run.pending[successor].fetch_sub(1, Ordering::AcqRel);
                 debug_assert!(previous > 0, "successor pending count underflow");
                 if previous == 1 {
+                    ready_successors += 1;
                     self.schedule_ready_graph(
                         &mut continuation,
                         ScheduledTask {
@@ -1187,6 +1301,11 @@ impl ExecutorInner {
                         },
                         Some(worker_id),
                     );
+                }
+            }
+            if ready_successors != 0 {
+                if let Some(profile) = run.profile.as_deref() {
+                    profile.record_graph_ready_successors(ready_successors);
                 }
             }
         }
@@ -1290,10 +1409,16 @@ impl ExecutorInner {
 
     fn finish_task(&self, scheduled: &ScheduledTask) {
         let run = scheduled.run_state();
-        let node = &run.graph.nodes[scheduled.task_index];
-        run.pending[scheduled.task_index].store(node.predecessor_count, Ordering::Release);
-
+        // Each RunState is consumed by a single graph execution and dropped when
+        // outstanding reaches zero, so completed nodes do not need their pending
+        // counters restored on the hot path.
         if run.outstanding.fetch_sub(1, Ordering::AcqRel) == 1 {
+            Executor::commit_flow_profile(
+                run.profile.clone(),
+                run.profile_slot.clone(),
+                run.started_at
+                    .map_or(Duration::ZERO, |started_at| started_at.elapsed()),
+            );
             let result = run.final_result();
             run.handle.complete(result);
             // Remove the Arc<RunState> from live_run_states, dropping it.
@@ -1446,10 +1571,19 @@ struct RunState {
     error: Mutex<Option<FlowError>>,
     handle: RunHandle,
     cancelled: Arc<AtomicBool>,
+    profile: Option<Arc<FlowProfileState>>,
+    profile_slot: Option<Arc<Mutex<FlowProfile>>>,
+    started_at: Option<Instant>,
 }
 
 impl RunState {
-    fn new(graph: Arc<GraphSnapshot>, handle: RunHandle) -> Self {
+    fn new(
+        graph: Arc<GraphSnapshot>,
+        handle: RunHandle,
+        profile: Option<Arc<FlowProfileState>>,
+        profile_slot: Option<Arc<Mutex<FlowProfile>>>,
+    ) -> Self {
+        let started_at = profile.as_ref().map(|_| Instant::now());
         let pending = graph
             .initial_pending
             .iter()
@@ -1464,6 +1598,9 @@ impl RunState {
             error: Mutex::new(None),
             cancelled: handle.cancelled_flag(),
             handle,
+            profile,
+            profile_slot,
+            started_at,
         }
     }
 
@@ -1514,7 +1651,7 @@ fn worker_loop(worker_id: usize, inner: Arc<ExecutorInner>) {
         inner: Arc::clone(&inner),
     };
     let mut done = || inner.shutdown.load(Ordering::Acquire);
-    executor.drive_worker_until(worker_id, DriveMode::AllowPark, &mut done);
+    executor.drive_worker_until(worker_id, DriveMode::AllowPark, &mut done, None);
 }
 
 pub(crate) fn panic_payload_to_string(payload: Box<dyn Any + Send + 'static>) -> String {
@@ -1533,6 +1670,7 @@ fn execute_node_inline(
     worker_id: usize,
     scheduler: Option<Arc<dyn Fn(TaskId) + Send + Sync + 'static>>,
     cancelled: Arc<AtomicBool>,
+    profile: Option<&FlowProfileState>,
 ) -> Result<Option<Vec<usize>>, FlowError> {
     match &node.kind {
         TaskKind::Placeholder => Ok(None),
@@ -1587,7 +1725,13 @@ fn execute_node_inline(
             match panic::catch_unwind(AssertUnwindSafe(|| task(&subflow))) {
                 Ok(()) => {
                     let snapshot = subflow.snapshot();
-                    execute_graph_inline(&snapshot, executor, worker_id, Arc::clone(&cancelled))?;
+                    execute_graph_inline(
+                        &snapshot,
+                        executor,
+                        worker_id,
+                        Arc::clone(&cancelled),
+                        profile,
+                    )?;
                     Ok(None)
                 }
                 Err(payload) => Err(FlowError::panic(
@@ -1599,7 +1743,7 @@ fn execute_node_inline(
         }
         TaskKind::Composed(flow) => {
             let snapshot = flow.snapshot();
-            execute_graph_inline(snapshot.as_ref(), executor, worker_id, cancelled)?;
+            execute_graph_inline(snapshot.as_ref(), executor, worker_id, cancelled, profile)?;
             Ok(None)
         }
     }
@@ -1610,6 +1754,7 @@ fn execute_graph_inline(
     executor: &Executor,
     worker_id: usize,
     cancelled: Arc<AtomicBool>,
+    profile: Option<&FlowProfileState>,
 ) -> Result<(), FlowError> {
     const SMALL_INLINE_GRAPH_LIMIT: usize = 32;
 
@@ -1620,7 +1765,7 @@ fn execute_graph_inline(
     if graph.nodes.len() <= SMALL_INLINE_GRAPH_LIMIT
         && graph.nodes.iter().all(|node| !node.kind.is_condition())
     {
-        return execute_graph_inline_small(graph, executor, worker_id, cancelled);
+        return execute_graph_inline_small(graph, executor, worker_id, cancelled, profile);
     }
 
     let mut pending = graph.initial_pending.clone();
@@ -1632,9 +1777,7 @@ fn execute_graph_inline(
         let task_index = queue[head];
         head += 1;
         let node = &graph.nodes[task_index];
-        let initial_pending = graph.initial_pending[task_index];
         if cancelled.load(Ordering::Acquire) {
-            pending[task_index] = initial_pending;
             outstanding -= 1;
             if outstanding == 0 {
                 break;
@@ -1644,12 +1787,14 @@ fn execute_graph_inline(
 
         executor.inner.notify_task_started(worker_id, node);
         let selected_successors =
-            execute_node_inline(node, executor, worker_id, None, Arc::clone(&cancelled));
+            execute_node_inline(node, executor, worker_id, None, Arc::clone(&cancelled), profile);
         executor.inner.notify_task_finished(worker_id, node);
+        if let Some(profile) = profile {
+            profile.record_graph_task_executed();
+        }
         let selected_successors = selected_successors?;
 
         if cancelled.load(Ordering::Acquire) {
-            pending[task_index] = initial_pending;
             outstanding -= 1;
             if outstanding == 0 {
                 break;
@@ -1659,6 +1804,9 @@ fn execute_graph_inline(
 
         if node.kind.is_condition() {
             if let Some(successors) = selected_successors {
+                if let Some(profile) = profile {
+                    profile.record_graph_ready_successors(successors.len() as u64);
+                }
                 for successor_position in successors {
                     if let Some(&successor) = node.successors.get(successor_position) {
                         queue.push(successor);
@@ -1667,18 +1815,27 @@ fn execute_graph_inline(
                 }
             }
         } else {
+            if let Some(profile) = profile {
+                profile.record_graph_pending_decrements(node.successors.len() as u64);
+            }
+            let mut ready_successors = 0u64;
             for &successor in &node.successors {
                 let previous = pending[successor];
                 debug_assert!(previous > 0, "successor pending count underflow");
                 pending[successor] = previous - 1;
                 if previous == 1 {
+                    ready_successors += 1;
                     queue.push(successor);
                     outstanding += 1;
                 }
             }
+            if ready_successors != 0 {
+                if let Some(profile) = profile {
+                    profile.record_graph_ready_successors(ready_successors);
+                }
+            }
         }
 
-        pending[task_index] = initial_pending;
         outstanding -= 1;
         if outstanding == 0 {
             break;
@@ -1693,6 +1850,7 @@ fn execute_graph_inline_small(
     executor: &Executor,
     worker_id: usize,
     cancelled: Arc<AtomicBool>,
+    profile: Option<&FlowProfileState>,
 ) -> Result<(), FlowError> {
     const SMALL_INLINE_GRAPH_LIMIT: usize = 32;
 
@@ -1713,10 +1871,8 @@ fn execute_graph_inline_small(
         head += 1;
 
         let node = &graph.nodes[task_index];
-        let initial_pending = graph.initial_pending[task_index];
 
         if cancelled.load(Ordering::Acquire) {
-            pending[task_index] = initial_pending;
             outstanding -= 1;
             if outstanding == 0 {
                 break;
@@ -1726,8 +1882,11 @@ fn execute_graph_inline_small(
 
         executor.inner.notify_task_started(worker_id, node);
         let selected_successors =
-            execute_node_inline(node, executor, worker_id, None, Arc::clone(&cancelled));
+            execute_node_inline(node, executor, worker_id, None, Arc::clone(&cancelled), profile);
         executor.inner.notify_task_finished(worker_id, node);
+        if let Some(profile) = profile {
+            profile.record_graph_task_executed();
+        }
         let selected_successors = selected_successors?;
 
         debug_assert!(
@@ -1736,7 +1895,6 @@ fn execute_graph_inline_small(
         );
 
         if cancelled.load(Ordering::Acquire) {
-            pending[task_index] = initial_pending;
             outstanding -= 1;
             if outstanding == 0 {
                 break;
@@ -1744,11 +1902,16 @@ fn execute_graph_inline_small(
             continue;
         }
 
+        if let Some(profile) = profile {
+            profile.record_graph_pending_decrements(node.successors.len() as u64);
+        }
+        let mut ready_successors = 0u64;
         for &successor in &node.successors {
             let previous = pending[successor];
             debug_assert!(previous > 0, "successor pending count underflow");
             pending[successor] = previous - 1;
             if previous == 1 {
+                ready_successors += 1;
                 debug_assert!(
                     tail < SMALL_INLINE_GRAPH_LIMIT,
                     "small inline DAG queue overflowed unexpectedly"
@@ -1758,8 +1921,12 @@ fn execute_graph_inline_small(
                 outstanding += 1;
             }
         }
+        if ready_successors != 0 {
+            if let Some(profile) = profile {
+                profile.record_graph_ready_successors(ready_successors);
+            }
+        }
 
-        pending[task_index] = initial_pending;
         outstanding -= 1;
         if outstanding == 0 {
             break;

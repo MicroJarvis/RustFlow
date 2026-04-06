@@ -5,14 +5,15 @@ use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
 
 use flow_core::{AsyncHandle, Executor, FlowError, RuntimeCtx};
 
-use crate::parallel_for::{
-    ParallelForOptions, chunk_ranges_for_workers,
-};
+use crate::parallel_for::{ParallelForOptions, chunk_ranges_for_workers};
 
 const SCAN_SEQUENTIAL_CUTOFF_PER_WORKER: usize = 2_048;
+// Sort tuning knobs. Keep these local until the benchmark contract is stable.
 const SORT_SEQUENTIAL_CUTOFF_PER_WORKER: usize = 32_768;
 const SORT_INSERTION_SORT_THRESHOLD: usize = 24;
 const SORT_PARTIAL_INSERTION_SORT_LIMIT: usize = 8;
+const SORT_NINTHER_THRESHOLD: usize = 128;
+const SORT_IMBALANCED_PARTITION_DIVISOR: usize = 8;
 
 /// Thread-safe wrapper for UnsafeCell buffer where each worker has exclusive access to its chunk.
 struct ScanBuffer<T> {
@@ -21,7 +22,8 @@ struct ScanBuffer<T> {
 
 impl<T> ScanBuffer<T> {
     fn new(len: usize, default: T) -> Self
-    where T: Clone
+    where
+        T: Clone,
     {
         Self {
             data: (0..len).map(|_| UnsafeCell::new(default.clone())).collect(),
@@ -35,13 +37,17 @@ impl<T> ScanBuffer<T> {
     }
 
     unsafe fn read(&self, index: usize) -> T
-    where T: Clone
+    where
+        T: Clone,
     {
         unsafe { (*self.data[index].get()).clone() }
     }
 
     fn into_inner(self) -> Vec<T> {
-        self.data.into_iter().map(|cell| cell.into_inner()).collect()
+        self.data
+            .into_iter()
+            .map(|cell| cell.into_inner())
+            .collect()
     }
 }
 
@@ -133,7 +139,9 @@ where
     unsafe impl<T: Send> Sync for CacheLine<T> {}
 
     let block_sums: Arc<Vec<CacheLine<T>>> = Arc::new(
-        (0..w).map(|_| CacheLine(UnsafeCell::new(default.clone()))).collect()
+        (0..w)
+            .map(|_| CacheLine(UnsafeCell::new(default.clone())))
+            .collect(),
     );
 
     let counter = Arc::new(AtomicUsize::new(0));
@@ -180,9 +188,8 @@ where
                                     None => block_sum,
                                 });
                                 unsafe {
-                                    *block_sums[i].0.get() = prefix
-                                        .clone()
-                                        .expect("scan block prefix should exist");
+                                    *block_sums[i].0.get() =
+                                        prefix.clone().expect("scan block prefix should exist");
                                 }
                             }
                             counter.store(0, AtomicOrdering::Release);
@@ -258,7 +265,9 @@ where
     unsafe impl<T: Send> Sync for CacheLine<T> {}
 
     let block_sums: Arc<Vec<CacheLine<T>>> = Arc::new(
-        (0..w).map(|_| CacheLine(UnsafeCell::new(default.clone()))).collect()
+        (0..w)
+            .map(|_| CacheLine(UnsafeCell::new(default.clone())))
+            .collect(),
     );
 
     let counter = Arc::new(AtomicUsize::new(0));
@@ -317,9 +326,8 @@ where
                                     None => block_sum,
                                 });
                                 unsafe {
-                                    *block_sums[i].0.get() = prefix
-                                        .clone()
-                                        .expect("scan block prefix should exist");
+                                    *block_sums[i].0.get() =
+                                        prefix.clone().expect("scan block prefix should exist");
                                 }
                             }
                             counter.store(0, AtomicOrdering::Release);
@@ -466,6 +474,13 @@ where
     }
 }
 
+fn is_equal_by_less<T, F>(left: &T, right: &T, is_less: &F) -> bool
+where
+    F: Fn(&T, &T) -> bool + ?Sized,
+{
+    !is_less(left, right) && !is_less(right, left)
+}
+
 fn initial_sort_bad_partition_budget(len: usize) -> usize {
     len.checked_ilog2().unwrap_or(0) as usize * 2
 }
@@ -479,6 +494,41 @@ where
         while current > 0 && is_less(&slice[current], &slice[current - 1]) {
             slice.swap(current, current - 1);
             current -= 1;
+        }
+    }
+}
+
+unsafe fn unguarded_insertion_sort_by_less<T, F>(
+    data: SharedMutPtr<T>,
+    begin: usize,
+    end: usize,
+    is_less: &F,
+) where
+    F: Fn(&T, &T) -> bool + ?Sized,
+{
+    if end.saturating_sub(begin) < 2 {
+        return;
+    }
+
+    for index in begin + 1..end {
+        unsafe {
+            if !is_less(&*data.0.add(index), &*data.0.add(index - 1)) {
+                continue;
+            }
+
+            let mut current = index;
+            let value = std::ptr::read(data.0.add(index));
+
+            loop {
+                std::ptr::copy(data.0.add(current - 1), data.0.add(current), 1);
+                current -= 1;
+
+                if !is_less(&value, &*data.0.add(current - 1)) {
+                    break;
+                }
+            }
+
+            std::ptr::write(data.0.add(current), value);
         }
     }
 }
@@ -507,6 +557,165 @@ where
     }
 
     true
+}
+
+fn sort2_by_less<T, F>(slice: &mut [T], a: usize, b: usize, is_less: &F)
+where
+    F: Fn(&T, &T) -> bool + ?Sized,
+{
+    if is_less(&slice[b], &slice[a]) {
+        slice.swap(a, b);
+    }
+}
+
+fn sort3_by_less<T, F>(slice: &mut [T], a: usize, b: usize, c: usize, is_less: &F)
+where
+    F: Fn(&T, &T) -> bool + ?Sized,
+{
+    sort2_by_less(slice, a, b, is_less);
+    sort2_by_less(slice, b, c, is_less);
+    sort2_by_less(slice, a, b, is_less);
+}
+
+fn choose_pivot_index_by_less<T, F>(slice: &mut [T], is_less: &F) -> usize
+where
+    F: Fn(&T, &T) -> bool + ?Sized,
+{
+    let len = slice.len();
+    let mid = len / 2;
+
+    if len < SORT_NINTHER_THRESHOLD {
+        sort3_by_less(slice, mid, 0, len - 1, is_less);
+        return 0;
+    }
+
+    sort3_by_less(slice, 0, mid, len - 1, is_less);
+    sort3_by_less(slice, 1, mid - 1, len - 2, is_less);
+    sort3_by_less(slice, 2, mid + 1, len - 3, is_less);
+    sort3_by_less(slice, mid - 1, mid, mid + 1, is_less);
+    slice.swap(0, mid);
+    0
+}
+
+struct PartitionResult {
+    left_len: usize,
+    equal_len: usize,
+    already_partitioned: bool,
+}
+
+fn partition_by_less<T, F>(slice: &mut [T], pivot_index: usize, is_less: &F) -> PartitionResult
+where
+    F: Fn(&T, &T) -> bool + ?Sized,
+{
+    let len = slice.len();
+    debug_assert!(len > 0);
+
+    let pivot_slot = len - 1;
+    let mut already_partitioned = true;
+    if pivot_index != pivot_slot {
+        slice.swap(pivot_index, pivot_slot);
+        already_partitioned = false;
+    }
+
+    let mut less = 0usize;
+    let mut scan = 0usize;
+    let mut greater = pivot_slot;
+
+    while scan < greater {
+        if is_less(&slice[scan], &slice[pivot_slot]) {
+            if scan != less {
+                slice.swap(scan, less);
+                already_partitioned = false;
+            }
+            less += 1;
+            scan += 1;
+        } else if is_less(&slice[pivot_slot], &slice[scan]) {
+            greater -= 1;
+            if scan != greater {
+                slice.swap(scan, greater);
+                already_partitioned = false;
+            }
+        } else {
+            scan += 1;
+        }
+    }
+
+    if greater != pivot_slot {
+        slice.swap(greater, pivot_slot);
+        already_partitioned = false;
+    }
+
+    PartitionResult {
+        left_len: less,
+        equal_len: greater + 1 - less,
+        already_partitioned,
+    }
+}
+
+fn partition_equal_left_by_less<T, F>(slice: &mut [T], pivot_index: usize, is_less: &F) -> usize
+where
+    F: Fn(&T, &T) -> bool + ?Sized,
+{
+    debug_assert!(!slice.is_empty());
+
+    if pivot_index != 0 {
+        slice.swap(0, pivot_index);
+    }
+
+    let mut equal = 0usize;
+    let mut scan = 1usize;
+    let mut greater = slice.len();
+
+    while scan < greater {
+        if is_less(&slice[0], &slice[scan]) {
+            greater -= 1;
+            if scan != greater {
+                slice.swap(scan, greater);
+            }
+        } else {
+            equal += 1;
+            if scan != equal {
+                slice.swap(scan, equal);
+            }
+            scan += 1;
+        }
+    }
+
+    if equal != 0 {
+        slice.swap(0, equal);
+    }
+
+    equal + 1
+}
+
+fn break_patterns_by_less<T>(slice: &mut [T], left_len: usize, equal_len: usize) {
+    let len = slice.len();
+    let right_begin = left_len + equal_len;
+    let right_len = len.saturating_sub(right_begin);
+
+    if left_len >= SORT_INSERTION_SORT_THRESHOLD {
+        slice.swap(0, left_len / 4);
+        slice.swap(left_len - 1, left_len - left_len / 4);
+
+        if left_len > SORT_NINTHER_THRESHOLD {
+            slice.swap(1, left_len / 4 + 1);
+            slice.swap(2, left_len / 4 + 2);
+            slice.swap(left_len - 2, left_len - (left_len / 4 + 1));
+            slice.swap(left_len - 3, left_len - (left_len / 4 + 2));
+        }
+    }
+
+    if right_len >= SORT_INSERTION_SORT_THRESHOLD {
+        slice.swap(right_begin, right_begin + right_len / 4);
+        slice.swap(len - 1, len - right_len / 4);
+
+        if right_len > SORT_NINTHER_THRESHOLD {
+            slice.swap(right_begin + 1, right_begin + 1 + right_len / 4);
+            slice.swap(right_begin + 2, right_begin + 2 + right_len / 4);
+            slice.swap(len - 2, len - (1 + right_len / 4));
+            slice.swap(len - 3, len - (2 + right_len / 4));
+        }
+    }
 }
 
 fn sift_down_by_less<T, F>(slice: &mut [T], mut root: usize, end: usize, is_less: &F)
@@ -564,6 +773,31 @@ where
     }
 }
 
+unsafe fn sort_range_by_less<T, F>(
+    data: SharedMutPtr<T>,
+    begin: usize,
+    end: usize,
+    leftmost: bool,
+    is_less: &F,
+) where
+    F: Fn(&T, &T) -> bool + ?Sized,
+{
+    let len = end.saturating_sub(begin);
+    if len <= 1 {
+        return;
+    }
+
+    if len < SORT_INSERTION_SORT_THRESHOLD && !leftmost {
+        unsafe {
+            unguarded_insertion_sort_by_less(data, begin, end, is_less);
+        }
+        return;
+    }
+
+    let slice = unsafe { std::slice::from_raw_parts_mut(data.0.add(begin), len) };
+    sort_slice_by_less(slice, is_less);
+}
+
 unsafe fn parallel_sort_entry<T, F>(
     runtime: &RuntimeCtx,
     data: SharedMutPtr<T>,
@@ -585,6 +819,7 @@ where
             is_less,
             sequential_cutoff,
             bad_partition_budget,
+            true,
         )
     }
 }
@@ -597,12 +832,13 @@ unsafe fn parallel_quicksort<T, F>(
     is_less: Arc<F>,
     sequential_cutoff: usize,
     bad_partition_budget: usize,
+    mut leftmost: bool,
 ) -> Result<(), FlowError>
 where
     T: Send + 'static,
     F: Fn(&T, &T) -> bool + Send + Sync + 'static,
 {
-    let _bad_partition_budget = bad_partition_budget;
+    let mut bad_partition_budget = bad_partition_budget;
 
     loop {
         let len = end - begin;
@@ -611,44 +847,117 @@ where
         }
 
         if len <= sequential_cutoff {
-            let slice = unsafe { std::slice::from_raw_parts_mut(data.0.add(begin), len) };
-            sort_slice_by_less(slice, is_less.as_ref());
+            unsafe {
+                sort_range_by_less(data, begin, end, leftmost, is_less.as_ref());
+            }
             break;
         }
 
-        let mid = len / 2;
         let slice = unsafe { std::slice::from_raw_parts_mut(data.0.add(begin), len) };
-        slice.select_nth_unstable_by(mid, |left, right| {
-            ordering_from_is_less(is_less.as_ref(), left, right)
-        });
+        if bad_partition_budget == 0 {
+            heapsort_by_less(slice, is_less.as_ref());
+            break;
+        }
 
-        let pivot = begin + mid;
+        let pivot_index = choose_pivot_index_by_less(slice, is_less.as_ref());
+
+        if !leftmost
+            && unsafe {
+                is_equal_by_less(
+                    &*data.0.add(begin - 1),
+                    slice.get_unchecked(pivot_index),
+                    is_less.as_ref(),
+                )
+            }
+        {
+            let equal_prefix_len =
+                partition_equal_left_by_less(slice, pivot_index, is_less.as_ref());
+            begin += equal_prefix_len;
+            leftmost = false;
+            continue;
+        }
+
+        let partition = partition_by_less(slice, pivot_index, is_less.as_ref());
+
         let left_begin = begin;
-        let left_end = pivot;
-        let right_begin = pivot + 1;
+        let left_end = begin + partition.left_len;
+        let right_begin = left_end + partition.equal_len;
         let right_end = end;
-        let left_len = left_end.saturating_sub(left_begin);
-        let right_len = right_end.saturating_sub(right_begin);
+        let left_len = left_end - left_begin;
+        let right_len = right_end - right_begin;
+        let left_is_leftmost = leftmost;
+        let right_is_leftmost = false;
+        let highly_unbalanced = left_len < len / SORT_IMBALANCED_PARTITION_DIVISOR
+            || right_len < len / SORT_IMBALANCED_PARTITION_DIVISOR;
+
+        if highly_unbalanced {
+            bad_partition_budget -= 1;
+            if bad_partition_budget == 0 {
+                heapsort_by_less(slice, is_less.as_ref());
+                break;
+            }
+
+            break_patterns_by_less(slice, partition.left_len, partition.equal_len);
+        } else if partition.already_partitioned {
+            let left_sorted = left_len <= 1
+                || partial_insertion_sort_by_less(&mut slice[..left_len], is_less.as_ref());
+            let right_sorted = right_len <= 1
+                || partial_insertion_sort_by_less(
+                    &mut slice[right_begin - begin..],
+                    is_less.as_ref(),
+                );
+
+            if left_sorted && right_sorted {
+                break;
+            }
+        }
 
         if left_len <= sequential_cutoff && right_len <= sequential_cutoff {
             if left_len > 1 {
-                let left =
-                    unsafe { std::slice::from_raw_parts_mut(data.0.add(left_begin), left_len) };
-                sort_slice_by_less(left, is_less.as_ref());
+                unsafe {
+                    sort_range_by_less(
+                        data,
+                        left_begin,
+                        left_end,
+                        left_is_leftmost,
+                        is_less.as_ref(),
+                    );
+                }
             }
             if right_len > 1 {
-                let right =
-                    unsafe { std::slice::from_raw_parts_mut(data.0.add(right_begin), right_len) };
-                sort_slice_by_less(right, is_less.as_ref());
+                unsafe {
+                    sort_range_by_less(
+                        data,
+                        right_begin,
+                        right_end,
+                        right_is_leftmost,
+                        is_less.as_ref(),
+                    );
+                }
             }
             break;
         }
 
-        let (spawn_begin, spawn_end, inline_begin, inline_end) = if left_len <= right_len {
-            (left_begin, left_end, right_begin, right_end)
-        } else {
-            (right_begin, right_end, left_begin, left_end)
-        };
+        let (spawn_begin, spawn_end, spawn_leftmost, inline_begin, inline_end, inline_leftmost) =
+            if left_len <= right_len {
+                (
+                    left_begin,
+                    left_end,
+                    left_is_leftmost,
+                    right_begin,
+                    right_end,
+                    right_is_leftmost,
+                )
+            } else {
+                (
+                    right_begin,
+                    right_end,
+                    right_is_leftmost,
+                    left_begin,
+                    left_end,
+                    left_is_leftmost,
+                )
+            };
         let spawn_len = spawn_end.saturating_sub(spawn_begin);
         let inline_len = inline_end.saturating_sub(inline_begin);
 
@@ -663,6 +972,7 @@ where
                     spawned_is_less,
                     sequential_cutoff,
                     bad_partition_budget,
+                    spawn_leftmost,
                 )
                 .expect("parallel sort runtime child should succeed");
             });
@@ -674,6 +984,7 @@ where
 
         begin = inline_begin;
         end = inline_end;
+        leftmost = inline_leftmost;
     }
 
     runtime.corun_children()

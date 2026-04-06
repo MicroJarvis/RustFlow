@@ -2,9 +2,11 @@ use std::cell::RefCell;
 use std::collections::VecDeque;
 use std::fmt;
 use std::rc::Rc;
-use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Arc, RwLock};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex, RwLock};
+use std::time::Instant;
 
+use crate::perf::{FlowProfile, FlowProfileState};
 use crate::runtime::RuntimeCtx;
 use crate::semaphore::Semaphore;
 
@@ -331,6 +333,8 @@ struct FlowInner {
     graph: RwLock<Graph>,
     snapshot_generation: AtomicUsize,
     snapshot_cache: RwLock<Option<CachedGraphSnapshot>>,
+    profile_enabled: AtomicBool,
+    last_profile: Arc<Mutex<FlowProfile>>,
 }
 
 struct CachedGraphSnapshot {
@@ -344,6 +348,11 @@ impl FlowInner {
     }
 
     fn snapshot(&self) -> Arc<GraphSnapshot> {
+        self.snapshot_with_profile(None)
+    }
+
+    fn snapshot_with_profile(&self, profile: Option<&FlowProfileState>) -> Arc<GraphSnapshot> {
+        let snapshot_started = profile.map(|_| Instant::now());
         let generation = self.snapshot_generation.load(Ordering::Acquire);
         if let Some(snapshot) = self
             .snapshot_cache
@@ -354,11 +363,20 @@ impl FlowInner {
                 (cached.generation == generation).then(|| Arc::clone(&cached.snapshot))
             })
         {
+            if let (Some(profile), Some(snapshot_started)) = (profile, snapshot_started) {
+                profile.record_snapshot_cache_hit(
+                    snapshot_started.elapsed(),
+                    snapshot.nodes.len() as u64,
+                    snapshot_edge_count(snapshot.as_ref()),
+                    snapshot.roots.len() as u64,
+                );
+            }
             return snapshot;
         }
 
         let graph = self.graph.read().expect("flow graph poisoned");
         let generation = self.snapshot_generation.load(Ordering::Acquire);
+        let build_started = profile.map(|_| Instant::now());
         let snapshot = Arc::new(snapshot_graph(&graph));
         drop(graph);
 
@@ -373,8 +391,28 @@ impl FlowInner {
             });
         }
 
+        if let (Some(profile), Some(snapshot_started), Some(build_started)) =
+            (profile, snapshot_started, build_started)
+        {
+            profile.record_snapshot_cache_miss(
+                snapshot_started.elapsed(),
+                build_started.elapsed(),
+                snapshot.nodes.len() as u64,
+                snapshot_edge_count(snapshot.as_ref()),
+                snapshot.roots.len() as u64,
+            );
+        }
+
         snapshot
     }
+}
+
+fn snapshot_edge_count(snapshot: &GraphSnapshot) -> u64 {
+    snapshot
+        .nodes
+        .iter()
+        .map(|node| node.successors.len() as u64)
+        .sum()
 }
 
 #[derive(Clone)]
@@ -400,8 +438,29 @@ impl Flow {
                 graph: RwLock::new(Graph::default()),
                 snapshot_generation: AtomicUsize::new(0),
                 snapshot_cache: RwLock::new(None),
+                profile_enabled: AtomicBool::new(false),
+                last_profile: Arc::new(Mutex::new(FlowProfile::default())),
             }),
         }
+    }
+
+    pub fn set_profile_enabled(&self, enabled: bool) {
+        self.inner.profile_enabled.store(enabled, Ordering::Release);
+        if !enabled {
+            *self
+                .inner
+                .last_profile
+                .lock()
+                .expect("flow profile poisoned") = FlowProfile::default();
+        }
+    }
+
+    pub fn last_profile(&self) -> FlowProfile {
+        *self
+            .inner
+            .last_profile
+            .lock()
+            .expect("flow profile poisoned")
     }
 
     pub fn builder(&self) -> FlowBuilder {
@@ -513,6 +572,32 @@ impl Flow {
 
     pub(crate) fn snapshot(&self) -> Arc<GraphSnapshot> {
         self.inner.snapshot()
+    }
+
+    pub(crate) fn snapshot_for_run(
+        &self,
+    ) -> (
+        Arc<GraphSnapshot>,
+        Option<Arc<FlowProfileState>>,
+        Option<Arc<Mutex<FlowProfile>>>,
+    ) {
+        let profile = self
+            .inner
+            .profile_enabled
+            .load(Ordering::Acquire)
+            .then(|| Arc::new(FlowProfileState::default()));
+        if profile.is_some() {
+            *self
+                .inner
+                .last_profile
+                .lock()
+                .expect("flow profile poisoned") = FlowProfile::default();
+        }
+        let snapshot = self.inner.snapshot_with_profile(profile.as_deref());
+        let last_profile = profile
+            .as_ref()
+            .map(|_| Arc::clone(&self.inner.last_profile));
+        (snapshot, profile, last_profile)
     }
 }
 

@@ -61,6 +61,7 @@ cargo run -p benchmarks -- \
 - `docs/epics.md`
 - `docs/stories.md`
 - `docs/plans/2026-04-05-post-lockfree-queue-performance-plan.md`
+- `docs/plans/2026-04-05-post-lockfree-progress-report.md`
 - `benchmarks/reports/taskflow_compare/current_live_20260405/taskflow_vs_rustflow_report.md`
 
 ## Suggested Next Focus

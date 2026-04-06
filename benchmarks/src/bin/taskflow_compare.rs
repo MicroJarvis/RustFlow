@@ -7,7 +7,7 @@ use std::os::raw::{c_int, c_uint};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -34,6 +34,8 @@ struct Config {
     profile: Profile,
     output_dir: PathBuf,
     selected_cases: Option<Vec<String>>,
+    pipeline_profile: bool,
+    flow_profile: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -131,6 +133,8 @@ fn parse_args(args: Vec<String>) -> Config {
     let mut rounds = 1usize;
     let mut output_dir = workspace_root().join("benchmarks/reports/taskflow_compare");
     let mut selected_cases = None;
+    let mut pipeline_profile = false;
+    let mut flow_profile = false;
 
     let mut index = 0usize;
     while index < args.len() {
@@ -167,6 +171,12 @@ fn parse_args(args: Vec<String>) -> Config {
                         .collect(),
                 );
             }
+            "--pipeline-profile" => {
+                pipeline_profile = true;
+            }
+            "--flow-profile" => {
+                flow_profile = true;
+            }
             "--help" | "-h" => {
                 print_help();
                 std::process::exit(0);
@@ -182,6 +192,8 @@ fn parse_args(args: Vec<String>) -> Config {
         profile: Profile::Report,
         output_dir,
         selected_cases,
+        pipeline_profile,
+        flow_profile,
     }
 }
 
@@ -191,6 +203,8 @@ fn print_help() {
     println!("  --rounds <usize>       benchmark rounds per point");
     println!("  --output-dir <path>    report output directory");
     println!("  --cases <csv>          run only a subset of benchmark ids");
+    println!("  --pipeline-profile     emit RustFlow pipeline diagnostics to stderr");
+    println!("  --flow-profile         emit RustFlow flow/DAG diagnostics to stderr");
 }
 
 impl TaskflowHarness {
@@ -714,6 +728,13 @@ impl<T> SharedMutPtr<T> {
         unsafe {
             self.0.add(index).write(value);
         }
+    }
+
+    unsafe fn read(self, index: usize) -> T
+    where
+        T: Copy,
+    {
+        unsafe { *self.0.add(index) }
     }
 }
 
@@ -1351,7 +1372,16 @@ fn run_data_pipeline_case(config: &Config, harness: &TaskflowHarness) -> CaseRes
                         work_int(value);
                     });
 
+                if config.pipeline_profile {
+                    pipeline.set_profile_enabled(true);
+                }
                 pipeline.run(&executor).wait().map_err(|error| error.to_string())?;
+                if config.pipeline_profile {
+                    eprintln!(
+                        "[pipeline-profile] case=data_pipeline size={size} {}",
+                        pipeline.last_profile()
+                    );
+                }
                 Ok(pipeline.num_tokens())
             })
         },
@@ -1483,33 +1513,21 @@ fn run_graph_pipeline_case(config: &Config, harness: &TaskflowHarness) -> CaseRe
         taskflow_note,
         |dimension| {
             let graph = Arc::new(LevelGraph::new(dimension, dimension));
-            let values = Arc::new(
-                (0..dimension * dimension)
-                    .map(|_| AtomicI32::new(0))
-                    .collect::<Vec<_>>(),
-            );
-            average_ms(config.rounds, || {
-                let buffer = Arc::new((0..8).map(|_| AtomicI32::new(0)).collect::<Vec<_>>());
+            let total_nodes = dimension * dimension;
+            let mut values = vec![0i32; total_nodes];
+
+            average_reported_ms(config.rounds, || {
+                // Match the Taskflow fixture: pipeline timing excludes the per-run line buffer
+                // allocation and uses plain integer storage rather than extra Rust-side atomics.
+                // This fixture only uses per-line slots and per-token node values with
+                // pipeline-ordered access, so raw-pointer storage is sufficient here.
+                let mut buffer = vec![0i32; 8];
+                let buffer_ptr = SharedMutPtr::from_slice(buffer.as_mut_slice());
+                let values_ptr = SharedMutPtr::from_slice(values.as_mut_slice());
                 let total_nodes = dimension * dimension;
                 let graph_for_input = Arc::clone(&graph);
-                let values_for_input = Arc::clone(&values);
-                let buffer_for_input = Arc::clone(&buffer);
                 let graph_for_final = Arc::clone(&graph);
-                let values_for_final = Arc::clone(&values);
-                let buffer_for_final = Arc::clone(&buffer);
-                let filter1_buffer = Arc::clone(&buffer);
-                let filter1_values = Arc::clone(&values);
-                let filter2_buffer = Arc::clone(&buffer);
-                let filter2_values = Arc::clone(&values);
-                let filter3_buffer = Arc::clone(&buffer);
-                let filter3_values = Arc::clone(&values);
-                let filter4_buffer = Arc::clone(&buffer);
-                let filter4_values = Arc::clone(&values);
-                let filter5_buffer = Arc::clone(&buffer);
-                let filter5_values = Arc::clone(&values);
-                let filter6_buffer = Arc::clone(&buffer);
-                let filter6_values = Arc::clone(&values);
-
+                let start = Instant::now();
                 let pipeline = Pipeline::from_pipes(
                     8,
                     vec![
@@ -1521,42 +1539,58 @@ fn run_graph_pipeline_case(config: &Config, harness: &TaskflowHarness) -> CaseRe
                             let level = ctx.token() / graph_for_input.length;
                             let index = ctx.token() % graph_for_input.length;
                             let uid = graph_for_input.uid(level, index) as i32;
-                            buffer_for_input[ctx.line()].store(uid, Ordering::Relaxed);
+                            unsafe {
+                                buffer_ptr.write(ctx.line(), uid);
+                            }
                             let value = graph_pipeline_work(uid);
-                            values_for_input[uid as usize].store(value, Ordering::Relaxed);
+                            unsafe {
+                                values_ptr.write(uid as usize, value);
+                            }
                         }),
                         Pipe::serial(move |ctx| {
-                            let uid = filter1_buffer[ctx.line()].load(Ordering::Relaxed) as usize;
+                            let uid = unsafe { buffer_ptr.read(ctx.line()) as usize };
                             let value = graph_pipeline_work(uid as i32);
-                            filter1_values[uid].store(value, Ordering::Relaxed);
+                            unsafe {
+                                values_ptr.write(uid, value);
+                            }
                         }),
                         Pipe::serial(move |ctx| {
-                            let uid = filter2_buffer[ctx.line()].load(Ordering::Relaxed) as usize;
+                            let uid = unsafe { buffer_ptr.read(ctx.line()) as usize };
                             let value = graph_pipeline_work(uid as i32);
-                            filter2_values[uid].store(value, Ordering::Relaxed);
+                            unsafe {
+                                values_ptr.write(uid, value);
+                            }
                         }),
                         Pipe::serial(move |ctx| {
-                            let uid = filter3_buffer[ctx.line()].load(Ordering::Relaxed) as usize;
+                            let uid = unsafe { buffer_ptr.read(ctx.line()) as usize };
                             let value = graph_pipeline_work(uid as i32);
-                            filter3_values[uid].store(value, Ordering::Relaxed);
+                            unsafe {
+                                values_ptr.write(uid, value);
+                            }
                         }),
                         Pipe::serial(move |ctx| {
-                            let uid = filter4_buffer[ctx.line()].load(Ordering::Relaxed) as usize;
+                            let uid = unsafe { buffer_ptr.read(ctx.line()) as usize };
                             let value = graph_pipeline_work(uid as i32);
-                            filter4_values[uid].store(value, Ordering::Relaxed);
+                            unsafe {
+                                values_ptr.write(uid, value);
+                            }
                         }),
                         Pipe::serial(move |ctx| {
-                            let uid = filter5_buffer[ctx.line()].load(Ordering::Relaxed) as usize;
+                            let uid = unsafe { buffer_ptr.read(ctx.line()) as usize };
                             let value = graph_pipeline_work(uid as i32);
-                            filter5_values[uid].store(value, Ordering::Relaxed);
+                            unsafe {
+                                values_ptr.write(uid, value);
+                            }
                         }),
                         Pipe::serial(move |ctx| {
-                            let uid = filter6_buffer[ctx.line()].load(Ordering::Relaxed) as usize;
+                            let uid = unsafe { buffer_ptr.read(ctx.line()) as usize };
                             let value = graph_pipeline_work(uid as i32);
-                            filter6_values[uid].store(value, Ordering::Relaxed);
+                            unsafe {
+                                values_ptr.write(uid, value);
+                            }
                         }),
                         Pipe::serial(move |ctx| {
-                            let uid = buffer_for_final[ctx.line()].load(Ordering::Relaxed) as usize;
+                            let uid = unsafe { buffer_ptr.read(ctx.line()) as usize };
                             let level = uid / graph_for_final.length;
                             let index = uid % graph_for_final.length;
                             let mut value = graph_pipeline_work(uid as i32);
@@ -1565,21 +1599,31 @@ fn run_graph_pipeline_case(config: &Config, harness: &TaskflowHarness) -> CaseRe
                                     .iter()
                                     .map(|(src, _)| {
                                         let previous = graph_for_final.uid(level - 1, *src);
-                                        values_for_final[previous].load(Ordering::Relaxed)
+                                        unsafe { values_ptr.read(previous) }
                                     })
                                     .sum::<i32>();
                                 value += carry;
                             }
-                            values_for_final[uid].store(value, Ordering::Relaxed);
+                            unsafe {
+                                values_ptr.write(uid, value);
+                            }
                         }),
                     ],
                 );
 
+                if config.pipeline_profile {
+                    pipeline.set_profile_enabled(true);
+                }
                 pipeline.run(&executor).wait().map_err(|error| error.to_string())?;
-                let checksum = values
-                    .iter()
-                    .fold(0i64, |acc, value| acc + value.load(Ordering::Relaxed) as i64);
-                Ok(checksum)
+                if config.pipeline_profile {
+                    eprintln!(
+                        "[pipeline-profile] case=graph_pipeline size={dimension} {}",
+                        pipeline.last_profile()
+                    );
+                }
+                let elapsed_ms = start.elapsed().as_secs_f64() * 1_000.0;
+                black_box(checksum_i32(&values));
+                Ok(elapsed_ms)
             })
         },
     )
@@ -1722,7 +1766,16 @@ fn run_linear_chain_case(config: &Config, harness: &TaskflowHarness) -> CaseResu
                 for index in 0..length.saturating_sub(1) {
                     tasks[index].precede([tasks[index + 1].clone()]);
                 }
+                if config.flow_profile {
+                    flow.set_profile_enabled(true);
+                }
                 executor.run(&flow).wait().map_err(|error| error.to_string())?;
+                if config.flow_profile {
+                    eprintln!(
+                        "[flow-profile] case=linear_chain size={length} {}",
+                        flow.last_profile()
+                    );
+                }
                 let count = counter.load(Ordering::Relaxed);
                 if count != length {
                     return Err(format!("linear chain mismatch: expected {length}, got {count}"));
@@ -1772,7 +1825,16 @@ fn run_linear_pipeline_case(config: &Config, harness: &TaskflowHarness) -> CaseR
                         Pipe::serial(|_| linear_pipeline_work()),
                     ],
                 );
+                if config.pipeline_profile {
+                    pipeline.set_profile_enabled(true);
+                }
                 pipeline.run(&executor).wait().map_err(|error| error.to_string())?;
+                if config.pipeline_profile {
+                    eprintln!(
+                        "[pipeline-profile] case=linear_pipeline size={size} {}",
+                        pipeline.last_profile()
+                    );
+                }
                 Ok(pipeline.num_tokens())
             })
         },
@@ -2100,7 +2162,9 @@ fn run_thread_pool_case(config: &Config, harness: &TaskflowHarness) -> CaseResul
         &points,
         taskflow_points,
         taskflow_note,
-        |iterations| average_ms(config.rounds, || thread_pool_flow(&executor, iterations)),
+        |iterations| average_ms(config.rounds, || {
+            thread_pool_flow(&executor, iterations, config.flow_profile)
+        }),
     )
 }
 
@@ -2126,7 +2190,7 @@ fn run_wavefront_case(config: &Config, harness: &TaskflowHarness) -> CaseResult 
         &points,
         taskflow_points,
         taskflow_note,
-        |size| average_ms(config.rounds, || wavefront_flow(&executor, size)),
+        |size| average_ms(config.rounds, || wavefront_flow(&executor, size, config.flow_profile)),
     )
 }
 
@@ -2529,12 +2593,12 @@ fn thread_pool_bench_func(loop_len: u64) -> f32 {
     acc
 }
 
-fn thread_pool_flow(executor: &Executor, iterations: usize) -> Result<u64, String> {
+fn thread_pool_flow(executor: &Executor, iterations: usize, flow_profile: bool) -> Result<u64, String> {
     const NUM_BLOCKS: usize = 1_000;
     const LOOP_LEN: u64 = 100;
     let total = Arc::new(AtomicU64::new(0));
 
-    for _ in 0..iterations {
+    for iteration in 0..iterations {
         let flow = Flow::new();
         for _ in 0..NUM_BLOCKS {
             let total = Arc::clone(&total);
@@ -2545,16 +2609,25 @@ fn thread_pool_flow(executor: &Executor, iterations: usize) -> Result<u64, Strin
                 );
             });
         }
+        if flow_profile && iteration == 0 {
+            flow.set_profile_enabled(true);
+        }
         executor
             .run(&flow)
             .wait()
             .map_err(|error| error.to_string())?;
+        if flow_profile && iteration == 0 {
+            eprintln!(
+                "[flow-profile] case=thread_pool size={iterations} {}",
+                flow.last_profile()
+            );
+        }
     }
 
     Ok(total.load(Ordering::Relaxed))
 }
 
-fn wavefront_flow(executor: &Executor, size: usize) -> Result<usize, String> {
+fn wavefront_flow(executor: &Executor, size: usize, flow_profile: bool) -> Result<usize, String> {
     let m = size;
     let n = size;
     let b = 8usize;
@@ -2584,10 +2657,19 @@ fn wavefront_flow(executor: &Executor, size: usize) -> Result<usize, String> {
         }
     }
 
+    if flow_profile {
+        flow.set_profile_enabled(true);
+    }
     executor
         .run(&flow)
         .wait()
         .map_err(|error| error.to_string())?;
+    if flow_profile {
+        eprintln!(
+            "[flow-profile] case=wavefront size={size} {}",
+            flow.last_profile()
+        );
+    }
     Ok(total.load(Ordering::Relaxed))
 }
 

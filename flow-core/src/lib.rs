@@ -5,6 +5,7 @@ mod error;
 mod executor;
 mod flow;
 mod observer;
+mod perf;
 mod pipeline;
 mod runtime;
 mod semaphore;
@@ -21,6 +22,7 @@ pub use flow::{
     FlowTaskKind, FlowValidationError, Subflow, SubflowTaskHandle, TaskHandle, TaskId,
 };
 pub use observer::Observer;
+pub use perf::{FlowProfile, PipelineProfile};
 pub use pipeline::{DataPipeline, Pipe, PipeContext, PipeType, Pipeline, ScalablePipeline};
 pub use runtime::RuntimeCtx;
 pub use semaphore::Semaphore;

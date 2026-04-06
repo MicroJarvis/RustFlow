@@ -3,6 +3,7 @@ use std::marker::PhantomData;
 use std::mem::MaybeUninit;
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
+use std::time::Instant;
 
 /// A lightweight spinlock for short-held critical sections.
 /// More efficient than Mutex for very short lock durations.
@@ -45,6 +46,7 @@ impl<'a> Drop for SpinLockGuard<'a> {
 use crate::Executor;
 use crate::error::FlowError;
 use crate::executor::RunHandle;
+use crate::perf::{PipelineProfile, PipelineProfileState};
 use crate::runtime::RuntimeCtx;
 
 struct LineSlot<T> {
@@ -184,6 +186,8 @@ struct StaticPipelineInner {
     num_lines: usize,
     pipes: Vec<Pipe>,
     num_tokens: AtomicUsize,
+    profile_enabled: AtomicBool,
+    last_profile: Mutex<PipelineProfile>,
     run_lock: Mutex<()>,
 }
 
@@ -201,6 +205,8 @@ impl Pipeline {
                 num_lines,
                 pipes,
                 num_tokens: AtomicUsize::new(0),
+                profile_enabled: AtomicBool::new(false),
+                last_profile: Mutex::new(PipelineProfile::default()),
                 run_lock: Mutex::new(()),
             }),
         }
@@ -218,9 +224,21 @@ impl Pipeline {
         self.inner.num_tokens.load(Ordering::Acquire)
     }
 
+    pub fn set_profile_enabled(&self, enabled: bool) {
+        self.inner.profile_enabled.store(enabled, Ordering::Release);
+        if !enabled {
+            *lock_unpoisoned(&self.inner.last_profile) = PipelineProfile::default();
+        }
+    }
+
+    pub fn last_profile(&self) -> PipelineProfile {
+        *lock_unpoisoned(&self.inner.last_profile)
+    }
+
     pub fn reset(&self) {
         let _run_guard = lock_unpoisoned(&self.inner.run_lock);
         self.inner.num_tokens.store(0, Ordering::Release);
+        *lock_unpoisoned(&self.inner.last_profile) = PipelineProfile::default();
     }
 
     pub fn run(&self, executor: &Executor) -> RunHandle {
@@ -228,12 +246,22 @@ impl Pipeline {
         executor.schedule_runtime_runner(Box::new(move |runtime| {
             let _run_guard = lock_unpoisoned(&pipeline.inner.run_lock);
             pipeline.inner.num_tokens.store(0, Ordering::Release);
-            run_pipe_chain(
+            let profile_state = pipeline
+                .inner
+                .profile_enabled
+                .load(Ordering::Acquire)
+                .then(|| Arc::new(PipelineProfileState::default()));
+            let result = run_pipe_chain(
                 runtime,
                 pipeline.inner.num_lines,
                 pipeline.inner.pipes.clone(),
                 &pipeline.inner.num_tokens,
-            )
+                profile_state.clone(),
+            );
+            *lock_unpoisoned(&pipeline.inner.last_profile) = profile_state
+                .as_deref()
+                .map_or_else(PipelineProfile::default, PipelineProfileState::snapshot);
+            result
         }))
     }
 }
@@ -247,6 +275,8 @@ struct ScalablePipelineConfig {
 struct ScalablePipelineInner {
     config: Mutex<ScalablePipelineConfig>,
     num_tokens: AtomicUsize,
+    profile_enabled: AtomicBool,
+    last_profile: Mutex<PipelineProfile>,
     run_lock: Mutex<()>,
 }
 
@@ -266,6 +296,8 @@ impl ScalablePipeline {
                     pipes: Vec::new(),
                 }),
                 num_tokens: AtomicUsize::new(0),
+                profile_enabled: AtomicBool::new(false),
+                last_profile: Mutex::new(PipelineProfile::default()),
                 run_lock: Mutex::new(()),
             }),
         }
@@ -278,6 +310,8 @@ impl ScalablePipeline {
             inner: Arc::new(ScalablePipelineInner {
                 config: Mutex::new(ScalablePipelineConfig { num_lines, pipes }),
                 num_tokens: AtomicUsize::new(0),
+                profile_enabled: AtomicBool::new(false),
+                last_profile: Mutex::new(PipelineProfile::default()),
                 run_lock: Mutex::new(()),
             }),
         }
@@ -295,9 +329,21 @@ impl ScalablePipeline {
         self.inner.num_tokens.load(Ordering::Acquire)
     }
 
+    pub fn set_profile_enabled(&self, enabled: bool) {
+        self.inner.profile_enabled.store(enabled, Ordering::Release);
+        if !enabled {
+            *lock_unpoisoned(&self.inner.last_profile) = PipelineProfile::default();
+        }
+    }
+
+    pub fn last_profile(&self) -> PipelineProfile {
+        *lock_unpoisoned(&self.inner.last_profile)
+    }
+
     pub fn reset(&self) {
         let _run_guard = lock_unpoisoned(&self.inner.run_lock);
         self.inner.num_tokens.store(0, Ordering::Release);
+        *lock_unpoisoned(&self.inner.last_profile) = PipelineProfile::default();
     }
 
     pub fn reset_with_pipes(&self, pipes: Vec<Pipe>) {
@@ -306,6 +352,7 @@ impl ScalablePipeline {
         validate_resettable_pipe_config(config.num_lines, &pipes);
         config.pipes = pipes;
         self.inner.num_tokens.store(0, Ordering::Release);
+        *lock_unpoisoned(&self.inner.last_profile) = PipelineProfile::default();
     }
 
     pub fn reset_with_lines_and_pipes(&self, num_lines: usize, pipes: Vec<Pipe>) {
@@ -313,6 +360,7 @@ impl ScalablePipeline {
         validate_resettable_pipe_config(num_lines, &pipes);
         *lock_unpoisoned(&self.inner.config) = ScalablePipelineConfig { num_lines, pipes };
         self.inner.num_tokens.store(0, Ordering::Release);
+        *lock_unpoisoned(&self.inner.last_profile) = PipelineProfile::default();
     }
 
     pub fn run(&self, executor: &Executor) -> RunHandle {
@@ -325,12 +373,22 @@ impl ScalablePipeline {
                 return Err(FlowError::plain("pipeline has no pipes configured"));
             }
 
-            run_pipe_chain(
+            let profile_state = pipeline
+                .inner
+                .profile_enabled
+                .load(Ordering::Acquire)
+                .then(|| Arc::new(PipelineProfileState::default()));
+            let result = run_pipe_chain(
                 runtime,
                 config.num_lines,
                 config.pipes,
                 &pipeline.inner.num_tokens,
-            )
+                profile_state.clone(),
+            );
+            *lock_unpoisoned(&pipeline.inner.last_profile) = profile_state
+                .as_deref()
+                .map_or_else(PipelineProfile::default, PipelineProfileState::snapshot);
+            result
         }))
     }
 }
@@ -479,6 +537,8 @@ struct DataPipelineInner {
     num_lines: usize,
     stages: Arc<[DataStage]>,
     num_tokens: AtomicUsize,
+    profile_enabled: AtomicBool,
+    last_profile: Mutex<PipelineProfile>,
     run_lock: Mutex<()>,
 }
 
@@ -510,9 +570,21 @@ impl DataPipeline {
         self.inner.num_tokens.load(Ordering::Acquire)
     }
 
+    pub fn set_profile_enabled(&self, enabled: bool) {
+        self.inner.profile_enabled.store(enabled, Ordering::Release);
+        if !enabled {
+            *lock_unpoisoned(&self.inner.last_profile) = PipelineProfile::default();
+        }
+    }
+
+    pub fn last_profile(&self) -> PipelineProfile {
+        *lock_unpoisoned(&self.inner.last_profile)
+    }
+
     pub fn reset(&self) {
         let _run_guard = lock_unpoisoned(&self.inner.run_lock);
         self.inner.num_tokens.store(0, Ordering::Release);
+        *lock_unpoisoned(&self.inner.last_profile) = PipelineProfile::default();
     }
 
     pub fn run(&self, executor: &Executor) -> RunHandle {
@@ -521,12 +593,22 @@ impl DataPipeline {
             let _run_guard = lock_unpoisoned(&pipeline.inner.run_lock);
             pipeline.inner.num_tokens.store(0, Ordering::Release);
 
-            run_data_chain(
+            let profile_state = pipeline
+                .inner
+                .profile_enabled
+                .load(Ordering::Acquire)
+                .then(|| Arc::new(PipelineProfileState::default()));
+            let result = run_data_chain(
                 runtime,
                 pipeline.inner.num_lines,
                 Arc::clone(&pipeline.inner.stages),
                 &pipeline.inner.num_tokens,
-            )
+                profile_state.clone(),
+            );
+            *lock_unpoisoned(&pipeline.inner.last_profile) = profile_state
+                .as_deref()
+                .map_or_else(PipelineProfile::default, PipelineProfileState::snapshot);
+            result
         }))
     }
 
@@ -538,6 +620,8 @@ impl DataPipeline {
                 num_lines,
                 stages: Arc::from(stages),
                 num_tokens: AtomicUsize::new(0),
+                profile_enabled: AtomicBool::new(false),
+                last_profile: Mutex::new(PipelineProfile::default()),
                 run_lock: Mutex::new(()),
             }),
         }
@@ -613,10 +697,15 @@ struct PipelineRunState {
     flags: AtomicU8,
     cancelled: Arc<AtomicBool>,
     stage_locks: Vec<Option<SpinLock>>,
+    profile: Option<Arc<PipelineProfileState>>,
 }
 
 impl PipelineRunState {
-    fn new(stage_is_serial: Vec<bool>, cancelled: Arc<AtomicBool>) -> Self {
+    fn new(
+        stage_is_serial: Vec<bool>,
+        cancelled: Arc<AtomicBool>,
+        profile: Option<Arc<PipelineProfileState>>,
+    ) -> Self {
         Self {
             next_token: AtomicUsize::new(0),
             flags: AtomicU8::new(0),
@@ -625,6 +714,7 @@ impl PipelineRunState {
                 .into_iter()
                 .map(|is_serial| is_serial.then_some(SpinLock::new()))
                 .collect(),
+            profile,
         }
     }
 
@@ -661,28 +751,64 @@ fn acquire_serial_stage<'a>(
     stop_if_requested: bool,
 ) -> SerialStageAcquire<'a> {
     const STOP_CHECK_INTERVAL: usize = 8;
+    if let Some(guard) = stage_lock.try_lock() {
+        if let Some(profile) = run_state.profile.as_deref() {
+            profile.record_stage_fast_path(stop_if_requested);
+        }
+        return SerialStageAcquire::Acquired(guard);
+    }
+
+    let wait_started = run_state.profile.as_ref().map(|_| Instant::now());
     let max_spins = if stop_if_requested { 32 } else { 16 };
-    let mut spins = 0usize;
+    let mut retry_checks = 0usize;
+    let mut spins_since_yield = 0usize;
+    let mut total_spins = 0u64;
+    let mut total_yields = 0u64;
 
     loop {
+        retry_checks += 1;
         if let Some(guard) = stage_lock.try_lock() {
+            if let Some(profile) = run_state.profile.as_deref() {
+                profile.record_stage_wait(
+                    stop_if_requested,
+                    wait_started
+                        .as_ref()
+                        .expect("profiled stage wait should have a start time")
+                        .elapsed(),
+                    total_spins,
+                    total_yields,
+                );
+            }
             return SerialStageAcquire::Acquired(guard);
         }
 
-        spins += 1;
-        if spins % STOP_CHECK_INTERVAL == 0
+        if retry_checks % STOP_CHECK_INTERVAL == 0
             && (run_state.should_abort_immediately()
                 || (stop_if_requested && run_state.should_stop_issuing_tokens()))
         {
+            if let Some(profile) = run_state.profile.as_deref() {
+                profile.record_stage_wait(
+                    stop_if_requested,
+                    wait_started
+                        .as_ref()
+                        .expect("profiled stage wait should have a start time")
+                        .elapsed(),
+                    total_spins,
+                    total_yields,
+                );
+            }
             return SerialStageAcquire::StopRequested;
         }
 
-        if spins < max_spins {
+        spins_since_yield += 1;
+        if spins_since_yield < max_spins {
+            total_spins += 1;
             std::hint::spin_loop();
             continue;
         }
 
-        spins = 0;
+        spins_since_yield = 0;
+        total_yields += 1;
         std::thread::yield_now();
     }
 }
@@ -691,27 +817,41 @@ fn run_pipe_chain(
     num_lines: usize,
     pipes: Vec<Pipe>,
     num_tokens: &AtomicUsize,
+    profile: Option<Arc<PipelineProfileState>>,
 ) -> Result<(), FlowError> {
     let pipes: Arc<[Pipe]> = Arc::from(pipes);
+    let stage_is_serial: Vec<bool> = pipes
+        .iter()
+        .map(|pipe| pipe.pipe_type() == PipeType::Serial)
+        .collect();
+    let spawn_lines_globally = should_global_spawn_pipeline_lines(&stage_is_serial);
     let run_state = Arc::new(PipelineRunState::new(
-        pipes
-            .iter()
-            .map(|pipe| pipe.pipe_type() == PipeType::Serial)
-            .collect(),
+        stage_is_serial,
         runtime.cancelled_flag(),
+        profile,
     ));
     let batch_size = compute_batch_size(num_lines);
 
     for line in 1..num_lines {
         let pipes = Arc::clone(&pipes);
         let run_state = Arc::clone(&run_state);
-        runtime.silent_result_async(move |_| {
-            let result = run_pipe_line(pipes, line, Arc::clone(&run_state), batch_size);
-            if result.is_err() {
-                run_state.request_abort();
-            }
-            result
-        });
+        if spawn_lines_globally {
+            runtime.silent_result_async_global(move |_| {
+                let result = run_pipe_line(pipes, line, Arc::clone(&run_state), batch_size);
+                if result.is_err() {
+                    run_state.request_abort();
+                }
+                result
+            });
+        } else {
+            runtime.silent_result_async(move |_| {
+                let result = run_pipe_line(pipes, line, Arc::clone(&run_state), batch_size);
+                if result.is_err() {
+                    run_state.request_abort();
+                }
+                result
+            });
+        }
     }
 
     let inline_result = run_pipe_line(Arc::clone(&pipes), 0, Arc::clone(&run_state), batch_size);
@@ -719,7 +859,7 @@ fn run_pipe_chain(
         run_state.request_abort();
     }
 
-    let children_result = runtime.corun_children();
+    let children_result = runtime.corun_children_profiled(run_state.profile.as_deref());
     let result = match inline_result {
         Ok(()) => children_result,
         Err(error) => {
@@ -739,6 +879,13 @@ fn run_pipe_chain(
 /// For multi-line, batch_size=1 preserves strict token ordering across stages.
 fn compute_batch_size(num_lines: usize) -> usize {
     if num_lines <= 1 { 16 } else { 1 }
+}
+
+fn should_global_spawn_pipeline_lines(stage_is_serial: &[bool]) -> bool {
+    // All-serial pipelines rely on parent-local line scheduling to preserve
+    // deterministic token order at serial sinks. Mixed pipelines still benefit
+    // from making line runners immediately stealable by other workers.
+    stage_is_serial.iter().any(|is_serial| !*is_serial)
 }
 
 fn run_pipe_line(
@@ -836,26 +983,40 @@ fn run_data_chain(
     num_lines: usize,
     stages: Arc<[DataStage]>,
     num_tokens: &AtomicUsize,
+    profile: Option<Arc<PipelineProfileState>>,
 ) -> Result<(), FlowError> {
+    let stage_is_serial: Vec<bool> = stages
+        .iter()
+        .map(|stage| stage.pipe_type() == PipeType::Serial)
+        .collect();
+    let spawn_lines_globally = should_global_spawn_pipeline_lines(&stage_is_serial);
     let run_state = Arc::new(PipelineRunState::new(
-        stages
-            .iter()
-            .map(|stage| stage.pipe_type() == PipeType::Serial)
-            .collect(),
+        stage_is_serial,
         runtime.cancelled_flag(),
+        profile,
     ));
     let batch_size = compute_batch_size(num_lines);
 
     for line in 1..num_lines {
         let stages = Arc::clone(&stages);
         let run_state = Arc::clone(&run_state);
-        runtime.silent_result_async(move |_| {
-            let result = run_data_line(stages, line, Arc::clone(&run_state), batch_size);
-            if result.is_err() {
-                run_state.request_abort();
-            }
-            result
-        });
+        if spawn_lines_globally {
+            runtime.silent_result_async_global(move |_| {
+                let result = run_data_line(stages, line, Arc::clone(&run_state), batch_size);
+                if result.is_err() {
+                    run_state.request_abort();
+                }
+                result
+            });
+        } else {
+            runtime.silent_result_async(move |_| {
+                let result = run_data_line(stages, line, Arc::clone(&run_state), batch_size);
+                if result.is_err() {
+                    run_state.request_abort();
+                }
+                result
+            });
+        }
     }
 
     let inline_result = run_data_line(Arc::clone(&stages), 0, Arc::clone(&run_state), batch_size);
@@ -863,7 +1024,7 @@ fn run_data_chain(
         run_state.request_abort();
     }
 
-    let children_result = runtime.corun_children();
+    let children_result = runtime.corun_children_profiled(run_state.profile.as_deref());
     let result = match inline_result {
         Ok(()) => children_result,
         Err(error) => {
